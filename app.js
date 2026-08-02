@@ -85,6 +85,46 @@
     return window.I18N.getLang() === 'he' && f.he ? f.he : f.name;
   }
 
+  // ---- Language-aware naming ----
+  // Detect the primary language of a free-text string by scanning for Hebrew
+  // codepoints (U+0590–U+05FF). Anything without Hebrew letters is treated as
+  // English (the app's only other language).
+  function detectLang(str) {
+    return /[\u0590-\u05FF]/.test(String(str || '')) ? 'he' : 'en';
+  }
+
+  // Resolve the display name of any name-bearing object (inventory item,
+  // scan-session entry, barcode record, or monthly-shortfall snapshot) for the
+  // active UI language, gracefully falling back across the multilingual fields
+  // and the legacy single `name`. Fields recognised: nameHe/nameEn (items),
+  // he/name (session + barcode + catalog).
+  function localName(o) {
+    if (!o) return '';
+    if (window.I18N.getLang() === 'he')
+      return o.nameHe || o.he || o.nameEn || o.name || '';
+    return o.nameEn || o.name || o.nameHe || o.he || '';
+  }
+  // Alias kept expressive at call sites that operate on inventory items.
+  var itemName = localName;
+
+  // Given a typed/entered name plus any known bilingual pair (e.g. from a
+  // catalog pick), produce the {nameEn, nameHe} to persist. When the pair is
+  // unknown, detect the typed language, fill that side, and best-effort enrich
+  // the other side from the bundled foods catalog. Never fabricates a bad
+  // translation — the opposite side is left null for fallback if unknown.
+  function resolveNames(typed, knownEn, knownHe) {
+    typed = (typed || '').trim();
+    var en = (knownEn || '').trim();
+    var he = (knownHe || '').trim();
+    if (en || he) return { nameEn: en || null, nameHe: he || null };
+    if (!typed) return { nameEn: null, nameHe: null };
+    var m = foodMatch(typed);
+    if (detectLang(typed) === 'he') {
+      return { nameHe: typed, nameEn: m && m.name ? m.name : null };
+    }
+    return { nameEn: typed, nameHe: m && m.he ? m.he : null };
+  }
+
   // Best score for a query against an entry's search terms.
   // 0 = exact, 1 = starts-with, 2 = contains, -1 = no match.
   function scoreFood(f, q) {
@@ -397,6 +437,45 @@
     });
   }
 
+  // One-time migration: give legacy single-`name` items a bilingual pair.
+  // Detects the language of the existing name, fills that side, and best-effort
+  // enriches the other side from the bundled foods catalog. The legacy `name`
+  // is always preserved (render fallback), so this is loss-free. Per-user flag,
+  // idempotent, and interrupt-safe (only re-processes items still missing both
+  // localized names).
+  function migrateItemNames() {
+    var uid = window.CurrentUser && window.CurrentUser.id();
+    if (!uid) return Promise.resolve();
+    var FLAG = 'pantry.namemig.v1.' + uid;
+    try {
+      if (localStorage.getItem(FLAG)) return Promise.resolve();
+    } catch (e) {}
+    var pending = items.filter(function (i) {
+      return !i.nameEn && !i.nameHe && i.name;
+    });
+    if (!pending.length) {
+      try {
+        localStorage.setItem(FLAG, '1');
+      } catch (e) {}
+      return Promise.resolve();
+    }
+    var chain = Promise.resolve();
+    pending.forEach(function (it) {
+      chain = chain.then(function () {
+        var resolved = resolveNames(it.name, null, null);
+        // Never blank out the legacy name; only add the localized fields.
+        it.nameEn = resolved.nameEn;
+        it.nameHe = resolved.nameHe;
+        return window.PantryDB.put(it);
+      });
+    });
+    return chain.then(function () {
+      try {
+        localStorage.setItem(FLAG, '1');
+      } catch (e) {}
+    });
+  }
+
   // ---- Lazy scanner library loader (ZXing, ~336KB) ----
   // Loaded only on first scanner open — kept off the startup/parse path. The
   // service worker precaches vendor/zxing.min.js, so this resolves from cache
@@ -603,6 +682,10 @@
         return {
           id: i.id,
           name: i.name,
+          // Snapshot both names so past months render correctly in either
+          // language even after the item is edited or removed.
+          nameEn: i.nameEn || null,
+          nameHe: i.nameHe || null,
           emoji: itemEmoji(i),
           missing: i.desiredAmount - i.quantity,
           have: i.quantity,
@@ -644,6 +727,38 @@
   }
 
   // ---- Rendering (main screen) ----
+  // Reopener for the top-most state-preserving modal. Each such dialog sets
+  // this to a closure that re-creates itself with a snapshot of its in-progress
+  // state, and restores the previous value on close (so nested dialogs unwind
+  // correctly). On a language change we re-run it after the base re-render so
+  // the open dialog comes back translated with its state intact.
+  var reopenTop = null;
+
+  // Immediate, full, no-refresh re-render of the entire visible UI in the new
+  // language. Preserves: which base screen is shown (picker vs. inventory),
+  // the active user, scroll position, and any open state-preserving dialog.
+  function changeLanguage(l) {
+    if (l !== 'en' && l !== 'he') return;
+    if (window.I18N.getLang() === l) return;
+    var reopen = reopenTop; // capture before overlays are torn down
+    var y = window.scrollY || 0;
+    window.I18N.setLang(l); // updates <html lang/dir> + persists per user
+    // Tear down existing overlays/toasts; tracked dialogs are rebuilt below.
+    Array.prototype.slice
+      .call(document.querySelectorAll('.overlay, .toast'))
+      .forEach(function (o) {
+        o.remove();
+      });
+    reopenTop = null;
+    // Re-render whichever base screen is currently active.
+    if (window.CurrentUser && window.CurrentUser.id()) renderMain();
+    else renderPicker();
+    try {
+      window.scrollTo(0, y);
+    } catch (e) {}
+    if (reopen) reopen(); // bring back the open dialog, translated + stateful
+  }
+
   function renderMain() {
     if (!root) root = document.getElementById('root');
     root.innerHTML = '';
@@ -805,7 +920,7 @@
         'button',
         {
           class: 'step-btn' + (item.quantity <= 0 ? ' disabled' : ''),
-          'aria-label': '-',
+          'aria-label': t('a11y.decrease'),
           onclick: function (e) {
             e.stopPropagation();
             changeQty(item, -1);
@@ -823,7 +938,7 @@
         'button',
         {
           class: 'step-btn primary',
-          'aria-label': '+',
+          'aria-label': t('a11y.increase'),
           onclick: function (e) {
             e.stopPropagation();
             changeQty(item, 1);
@@ -855,7 +970,7 @@
       h(
         'div',
         { class: 'card-info' },
-        h('div', { class: 'card-name', text: item.name }),
+        h('div', { class: 'card-name', dir: 'auto', text: itemName(item) }),
         meta
       ),
       stepper
@@ -875,7 +990,7 @@
       h(
         'div',
         { class: 'card-info' },
-        h('div', { class: 'card-name', text: item.name }),
+        h('div', { class: 'card-name', dir: 'auto', text: itemName(item) }),
         h('div', {
           class: 'card-meta',
           text: t('restock.missing', {
@@ -889,7 +1004,7 @@
         'button',
         {
           class: 'step-btn primary big',
-          'aria-label': '+',
+          'aria-label': t('a11y.increase'),
           onclick: function (e) {
             e.stopPropagation();
             changeQty(item, 1);
@@ -934,8 +1049,15 @@
     opts = opts || {};
     var prefill = opts.prefill || {};
     var editing = !!existing;
-    var state = {
-      name: editing ? existing.name : prefill.name || '',
+    // A language change re-opens this dialog with a live snapshot via
+    // opts.stateOverride, preserving in-progress edits.
+    var state = opts.stateOverride || {
+      // Display name shown in the input: the active-language name for an
+      // existing item, else the prefill.
+      name: editing ? itemName(existing) : prefill.name || '',
+      // Bilingual pair carried through save (null when unknown → fallback).
+      nameEn: editing ? existing.nameEn || null : prefill.nameEn || null,
+      nameHe: editing ? existing.nameHe || null : prefill.nameHe || null,
       quantity: editing ? existing.quantity : 1,
       unit: editing ? existing.unit : 'pcs',
       categoryId: editing ? existing.categoryId : prefill.categoryId || 'other',
@@ -952,8 +1074,34 @@
     var overlay = h('div', { class: 'overlay' });
     var sheet = h('div', { class: 'sheet' });
 
+    // Register a state-preserving reopener so a mid-edit language change brings
+    // the dialog back translated with current values intact.
+    var prevReopen = reopenTop;
+    var myReopen = function () {
+      openForm(existing, {
+        prefill: prefill,
+        stateOverride: {
+          name: nameInput.value,
+          nameEn: state.nameEn,
+          nameHe: state.nameHe,
+          quantity: state.quantity,
+          unit: state.unit,
+          categoryId: state.categoryId,
+          location: state.location,
+          note: noteInput.value,
+          desiredAmount: state.desiredAmount,
+          barcode: state.barcode,
+          emoji: state.emoji,
+          imageFull: state.imageFull,
+          imageThumb: state.imageThumb,
+        },
+      });
+    };
+    reopenTop = myReopen;
+
     function close() {
       overlay.remove();
+      if (reopenTop === myReopen) reopenTop = prevReopen;
     }
     overlay.addEventListener('click', function (e) {
       if (e.target === overlay) close();
@@ -968,7 +1116,7 @@
           class: 'sheet-title',
           text: editing ? t('form.editTitle') : t('form.addTitle'),
         }),
-        h('button', { class: 'sheet-close', 'aria-label': 'X', onclick: close }, '✕')
+        h('button', { class: 'sheet-close', 'aria-label': t('a11y.close'), onclick: close }, '✕')
       )
     );
 
@@ -987,6 +1135,7 @@
     var nameInput = h('input', {
       class: 'input',
       type: 'text',
+      dir: 'auto',
       value: state.name,
       placeholder: t('form.namePlaceholder'),
       autocomplete: 'off',
@@ -1002,6 +1151,9 @@
     function applyFood(f) {
       nameInput.value = foodLabel(f);
       state.name = nameInput.value;
+      // Catalog picks carry a known bilingual pair — store both sides.
+      state.nameEn = f.name || null;
+      state.nameHe = f.he || null;
       state.emoji = f.emoji || null;
       if (f.category) {
         state.categoryId = f.category;
@@ -1064,7 +1216,7 @@
               },
             },
             h('span', { class: 'ac-emoji', text: f.emoji }),
-            h('span', { class: 'ac-name', text: foodLabel(f) })
+            h('span', { class: 'ac-name', dir: 'auto', text: foodLabel(f) })
           )
         );
       });
@@ -1074,6 +1226,10 @@
     nameInput.addEventListener('input', function () {
       state.name = nameInput.value;
       state.emoji = null; // typing invalidates a previously chosen emoji
+      // Manual edits invalidate a previously chosen catalog pair; the correct
+      // bilingual pair is recomputed from the typed text on save.
+      state.nameEn = null;
+      state.nameHe = null;
       nameInput.classList.remove('error');
       clearTimeout(acTimer);
       acTimer = setTimeout(renderAc, 120);
@@ -1311,9 +1467,14 @@
             state.categoryId = m.category;
         }
       }
+      // Resolve the bilingual pair: use the catalog pick if still valid,
+      // otherwise detect the typed language and enrich from the catalog.
+      var names = resolveNames(name, state.nameEn, state.nameHe);
       function finalize(imageHash) {
         var payload = {
           name: name,
+          nameEn: names.nameEn,
+          nameHe: names.nameHe,
           quantity: state.quantity,
           unit: state.unit,
           categoryId: state.categoryId,
@@ -1396,7 +1557,7 @@
       h('h2', { class: 'dialog-title', text: t('deleteConfirm.title') }),
       h('p', {
         class: 'dialog-msg',
-        text: t('deleteConfirm.message', { name: item.name }),
+        text: t('deleteConfirm.message', { name: itemName(item) }),
       }),
       h(
         'div',
@@ -1445,11 +1606,11 @@
           class: 'lang-row' + (active ? ' active' : ''),
           type: 'button',
           onclick: function () {
-            if (window.I18N.getLang() !== code) {
-              window.I18N.setLang(code);
-              (rerender || renderMain)();
-            }
             close();
+            // Full re-render (base screen + any open dialog) in the new lang.
+            // `rerender` is kept for backward compat but changeLanguage already
+            // re-renders the active base screen.
+            changeLanguage(code);
           },
         },
         h('span', { class: 'flag', text: flag }),
@@ -1470,7 +1631,8 @@
   }
 
   // ---- Monthly restock view ----
-  function openMonthly() {
+  function openMonthly(opts) {
+    opts = opts || {};
     recomputeShortfall();
     var log = window.PantryDB.getMonthlyLog();
     var current = ym();
@@ -1479,8 +1641,15 @@
     keys.sort().reverse();
 
     var overlay = h('div', { class: 'overlay center' });
+    // Reopen preserving the selected month across a language change.
+    var prevReopen = reopenTop;
+    var myReopen = function () {
+      openMonthly({ month: select.value });
+    };
+    reopenTop = myReopen;
     function close() {
       overlay.remove();
+      if (reopenTop === myReopen) reopenTop = prevReopen;
     }
     overlay.addEventListener('click', function (e) {
       if (e.target === overlay) close();
@@ -1547,7 +1716,7 @@
                 'div',
                 { class: 'monthly-item-main' },
                 thumb,
-                h('span', { class: 'monthly-item-name', text: s.name })
+                h('span', { class: 'monthly-item-name', dir: 'auto', text: localName(s) })
               ),
               h('span', {
                 class: 'monthly-item-miss',
@@ -1581,7 +1750,7 @@
         'div',
         { class: 'sheet-header' },
         h('h2', { class: 'dialog-title', text: t('monthly.title') }),
-        h('button', { class: 'sheet-close', onclick: close, 'aria-label': 'X' }, '✕')
+        h('button', { class: 'sheet-close', onclick: close, 'aria-label': t('a11y.close') }, '✕')
       ),
       h('label', { class: 'field-label', text: t('monthly.month') }),
       select,
@@ -1589,7 +1758,9 @@
     );
     overlay.appendChild(dialog);
     document.body.appendChild(overlay);
-    renderContent(current);
+    var initial = opts.month && keys.indexOf(opts.month) !== -1 ? opts.month : current;
+    select.value = initial;
+    renderContent(initial);
   }
 
   // ---- Toast ----
@@ -1726,8 +1897,7 @@
   }
 
   function scanDisplayName(p) {
-    if (window.I18N.getLang() === 'he') return p.he || p.name || t('scan.unknownName');
-    return p.name || p.he || t('scan.unknownName');
+    return localName(p) || t('scan.unknownName');
   }
 
   function openScanner() {
@@ -1894,7 +2064,7 @@
               'div',
               { class: 'scan-row' },
               itemThumb(e, 'sm'),
-              h('span', { class: 'scan-row-name', text: scanDisplayName(e) }),
+              h('span', { class: 'scan-row-name', dir: 'auto', text: scanDisplayName(e) }),
               h('span', { class: 'scan-row-count', text: '×' + e.count })
             )
           );
@@ -1940,7 +2110,8 @@
         if (local && local.source === 'inventory') {
           var it = local.item;
           addToSession({
-            barcode: code, name: it.name, image: thumbImageFor(it), emoji: it.emoji,
+            barcode: code, name: it.nameEn || it.name || '', he: it.nameHe || '',
+            image: thumbImageFor(it), emoji: it.emoji,
             categoryId: it.categoryId, unit: it.unit, itemId: it.id, source: 'inventory',
           });
           return;
@@ -2037,7 +2208,8 @@
           return persistFullImage(e.image)
             .then(function (imageHash) {
               return window.PantryDB.create({
-                name: nm, quantity: e.count, unit: e.unit, categoryId: e.categoryId,
+                name: nm, nameEn: e.name || null, nameHe: e.he || null,
+                quantity: e.count, unit: e.unit, categoryId: e.categoryId,
                 location: 'Pantry', barcode: e.barcode, emoji: e.emoji, imageHash: imageHash || null,
               });
             })
@@ -2078,12 +2250,12 @@
       { class: 'dialog' },
       h('div', { class: 'sheet-header' },
         h('h2', { class: 'dialog-title', text: t('scan.addUnitsTitle') }),
-        h('button', { class: 'sheet-close', 'aria-label': 'X', onclick: function () { close(false); } }, '✕')
+        h('button', { class: 'sheet-close', 'aria-label': t('a11y.close'), onclick: function () { close(false); } }, '✕')
       ),
       h('div', { class: 'scan-hero' },
         itemThumb(item),
         h('div', { class: 'scan-hero-info' },
-          h('div', { class: 'scan-hero-name', text: item.name }),
+          h('div', { class: 'scan-hero-name', dir: 'auto', text: itemName(item) }),
           h('div', { class: 'scan-hero-sub', text: t('scan.inStock', { qty: formatQty(item.quantity), unit: t('units.' + item.unit) }) })
         )
       ),
@@ -2137,7 +2309,7 @@
     sheet.appendChild(
       h('div', { class: 'sheet-header' },
         h('h2', { class: 'sheet-title', text: opts.isNew ? t('scan.newTitle') : t('scan.reviewTitle') }),
-        h('button', { class: 'sheet-close', 'aria-label': 'X', onclick: function () { close(false); } }, '✕')
+        h('button', { class: 'sheet-close', 'aria-label': t('a11y.close'), onclick: function () { close(false); } }, '✕')
       )
     );
     var body = h('div', { class: 'sheet-body' });
@@ -2157,7 +2329,7 @@
 
     // Names (English + Hebrew)
     body.appendChild(h('label', { class: 'field-label', text: t('scan.enName') }));
-    var enInput = h('input', { class: 'input', type: 'text', value: st.en, placeholder: t('form.namePlaceholder'), autocomplete: 'off' });
+    var enInput = h('input', { class: 'input', type: 'text', dir: 'auto', value: st.en, placeholder: t('form.namePlaceholder'), autocomplete: 'off' });
     body.appendChild(enInput);
     body.appendChild(h('label', { class: 'field-label', text: t('scan.heName') }));
     var heInput = h('input', { class: 'input', type: 'text', value: st.he, dir: 'rtl', autocomplete: 'off' });
@@ -2208,7 +2380,8 @@
           });
         } else {
           p = window.PantryDB.create({
-            name: primary, quantity: st.qty, unit: st.unit, categoryId: st.categoryId,
+            name: primary, nameEn: en || null, nameHe: he || null,
+            quantity: st.qty, unit: st.unit, categoryId: st.categoryId,
             location: 'Pantry', barcode: barcode, emoji: emoji || null, imageHash: imageHash || null,
           }).then(function (item) { recordDelta(item.quantity); });
         }
@@ -2275,7 +2448,10 @@
   }
 
   // Local EN/עברית segmented control bound to a mutable `state.lang`.
-  function langSegment(state) {
+  // Optional onChange(lang) fires on selection — used by the profile dialog to
+  // switch the live UI immediately; omitted for new/edit-user forms where the
+  // choice is only that profile's stored preference.
+  function langSegment(state, onChange) {
     var box = h('div', { class: 'segment' });
     function render() {
       box.innerHTML = '';
@@ -2283,7 +2459,11 @@
         box.appendChild(h('button', {
           class: 'segment-item' + (state.lang === p[0] ? ' active' : ''),
           type: 'button',
-          onclick: function () { state.lang = p[0]; render(); },
+          onclick: function () {
+            state.lang = p[0];
+            render();
+            if (onChange) onChange(p[0]);
+          },
         }, p[1]));
       });
     }
@@ -2307,9 +2487,7 @@
         h('button', {
           class: 'segment-item' + (window.I18N.getLang() === pair[0] ? ' active' : ''),
           type: 'button',
-          onclick: function () {
-            if (window.I18N.getLang() !== pair[0]) { window.I18N.setLang(pair[0]); renderPicker(); }
-          },
+          onclick: function () { changeLanguage(pair[0]); },
         }, pair[1])
       );
     });
@@ -2338,7 +2516,7 @@
             onclick: function (e) { e.stopPropagation(); renderEditUser(u); },
           }, '✏️'),
           av,
-          h('div', { class: 'user-card-name', text: u.displayName || u.username }),
+          h('div', { class: 'user-card-name', dir: 'auto', text: u.displayName || u.username }),
           u.username ? h('div', { class: 'user-card-sub', text: '@' + u.username }) : null
         )
       );
@@ -2369,7 +2547,7 @@
     overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
 
     var state = { avatar: null, lang: window.I18N.getLang() };
-    var nameInput = h('input', { class: 'input', type: 'text', placeholder: t('auth.displayNamePlaceholder'), 'aria-label': t('auth.displayName') });
+    var nameInput = h('input', { class: 'input', type: 'text', dir: 'auto', placeholder: t('auth.displayNamePlaceholder'), 'aria-label': t('auth.displayName') });
     var userInput = h('input', {
       class: 'input', type: 'text', placeholder: t('auth.usernamePlaceholder'), 'aria-label': t('auth.username'),
       autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false',
@@ -2404,7 +2582,7 @@
     var dialog = h('div', { class: 'dialog profile-dialog' },
       h('div', { class: 'sheet-header' },
         h('h2', { class: 'dialog-title', text: t('auth.createUserTitle') }),
-        h('button', { class: 'sheet-close', 'aria-label': 'X', onclick: close }, '✕')
+        h('button', { class: 'sheet-close', 'aria-label': t('a11y.close'), onclick: close }, '✕')
       ),
       avc.box, avc.input,
       h('label', { class: 'field-label', text: t('auth.displayName') }), nameInput,
@@ -2429,7 +2607,7 @@
 
     var isActive = !!(window.CurrentUser && window.CurrentUser.id() === u.id);
     var state = { avatar: u.avatar || null, lang: u.lang || window.I18N.getLang() };
-    var nameInput = h('input', { class: 'input', type: 'text', value: u.displayName || u.username || '', 'aria-label': t('auth.displayName') });
+    var nameInput = h('input', { class: 'input', type: 'text', dir: 'auto', value: u.displayName || u.username || '', 'aria-label': t('auth.displayName') });
     var avc = avatarControl(state, function () { return initialsOf(nameInput.value); });
     nameInput.addEventListener('input', function () { avc.rerender(); });
     var langBox = langSegment(state);
@@ -2452,7 +2630,7 @@
     var dialog = h('div', { class: 'dialog profile-dialog' },
       h('div', { class: 'sheet-header' },
         h('h2', { class: 'dialog-title', text: t('auth.editUserTitle') }),
-        h('button', { class: 'sheet-close', 'aria-label': 'X', onclick: close }, '✕')
+        h('button', { class: 'sheet-close', 'aria-label': t('a11y.close'), onclick: close }, '✕')
       ),
       avc.box, avc.input,
       h('label', { class: 'field-label', text: t('auth.displayName') }), nameInput,
@@ -2497,17 +2675,36 @@
   }
 
   // ---- Active-user profile (edit self, switch, choose another) ----
-  function openProfile() {
+  function openProfile(opts) {
+    opts = opts || {};
     var cu = window.CurrentUser;
     var overlay = h('div', { class: 'overlay center' });
-    function close() { overlay.remove(); }
+
+    // State-preserving reopener for a live language switch from within.
+    var prevReopen = reopenTop;
+    var myReopen = function () {
+      openProfile({ displayName: nameInput.value, avatar: state.avatar });
+    };
+    reopenTop = myReopen;
+    function close() {
+      overlay.remove();
+      if (reopenTop === myReopen) reopenTop = prevReopen;
+    }
     overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
 
-    var state = { avatar: cu.avatar(), lang: window.I18N.getLang() };
-    var nameInput = h('input', { class: 'input', type: 'text', value: cu.displayName() || '', 'aria-label': t('auth.displayName') });
+    var state = {
+      avatar: opts.avatar !== undefined ? opts.avatar : cu.avatar(),
+      lang: window.I18N.getLang(),
+    };
+    var nameInput = h('input', { class: 'input', type: 'text', dir: 'auto', value: opts.displayName != null ? opts.displayName : cu.displayName() || '', 'aria-label': t('auth.displayName') });
     var avc = avatarControl(state, function () { return initialsOf(nameInput.value) || cu.initials(); });
     nameInput.addEventListener('input', function () { avc.rerender(); });
-    var langBox = langSegment(state);
+    // Tapping a language switches the whole UI immediately AND persists it as
+    // this profile's preference; changeLanguage reopens this dialog translated.
+    var langBox = langSegment(state, function (l) {
+      window.Auth.updateProfile({ lang: l });
+      changeLanguage(l);
+    });
 
     function save() {
       var dn = nameInput.value.trim() || cu.username() || cu.displayName();
@@ -2522,7 +2719,7 @@
       { class: 'dialog profile-dialog' },
       h('div', { class: 'sheet-header' },
         h('h2', { class: 'dialog-title', text: t('auth.profile') }),
-        h('button', { class: 'sheet-close', 'aria-label': 'X', onclick: close }, '✕')
+        h('button', { class: 'sheet-close', 'aria-label': t('a11y.close'), onclick: close }, '✕')
       ),
       avc.box,
       avc.input,
@@ -2553,6 +2750,10 @@
       .then(function () {
         // One-time: fold any legacy inline images into the deduped image store.
         return migrateInlineImages();
+      })
+      .then(function () {
+        // One-time: give legacy single-name items a bilingual name pair.
+        return migrateItemNames();
       })
       .then(function () {
         recomputeShortfall();
@@ -2615,5 +2816,14 @@
       });
   }
 
-  window.App = { start: start, renderMain: renderMain };
+  window.App = {
+    start: start,
+    renderMain: renderMain,
+    // Pure, DOM-free helpers exposed for the automated logic harness.
+    _internals: {
+      detectLang: detectLang,
+      resolveNames: resolveNames,
+      localName: localName,
+    },
+  };
 })();

@@ -169,6 +169,10 @@
     var item = {
       id: newId(),
       name: (input.name || '').trim(),
+      // Bilingual names. Either may be empty; display code falls back to the
+      // available side (and finally to the legacy `name`).
+      nameEn: (input.nameEn || '').trim() || null,
+      nameHe: (input.nameHe || '').trim() || null,
       quantity: typeof input.quantity === 'number' ? input.quantity : 1,
       unit: input.unit || 'pcs',
       categoryId: input.categoryId || 'other',

@@ -1,11 +1,18 @@
-/* Automated logic harness for the passwordless open-profile system + per-user
-   storage. Runs on Node using the localStorage-fallback path of db.js. No
-   browser required.
+/* Automated logic harness for the passwordless open-profile system, per-user
+   storage, AND the bilingual (EN/HE) product-name system. Runs on Node using
+   the localStorage-fallback path of db.js. No browser required.
 
    Run: node tools/auth-test.js   (exit code 0 = all pass)
 
-   NOTE: This exercises logic only. Camera, RTL visuals, real IndexedDB and the
-   canvas image pipeline are covered by manual verification. */
+   Bilingual coverage: language detection, resolveNames (catalog pick +
+   catalog-enriched typed names), localName language-aware display + graceful
+   fallback (dual / single-side / legacy-only), loss-free idempotent name
+   migration with no duplicates, db.create name persistence, and full deep
+   EN/HE i18n key parity.
+
+   NOTE: This exercises logic only. Camera, RTL visuals, immediate re-render,
+   state preservation, real IndexedDB and the canvas image pipeline are covered
+   by the manual verification checklist. */
 'use strict';
 
 // ---- Minimal browser-ish stubs ----
@@ -30,6 +37,9 @@ global.localStorage = {
   removeItem: function (k) { delete _store[k]; },
 };
 global.window = {};
+// foods.js assigns to `self`; app.js reads `window.FOODS`. In the browser
+// self === window, so mirror that here for the localization helpers.
+global.self = global.window;
 
 // ---- Seed an OLD password-format profile store (v2, WITH credentials) so we
 //      can verify the one-time passwordless migration strips them safely. ----
@@ -66,10 +76,14 @@ _store['pantry.lang'] = 'he';
 require('../i18n.js');
 require('../db.js');
 require('../auth.js');
+require('../data/foods.js'); // sets self.FOODS (=> window.FOODS)
+window.FOODS = self.FOODS;
+require('../app.js'); // exposes window.App._internals (DOM-free helpers)
 var Auth = global.window.Auth;
 var CurrentUser = global.window.CurrentUser;
 var DB = global.window.PantryDB;
 var I18N = global.window.I18N;
+var AppI = global.window.App._internals;
 
 // ---- tiny assert framework ----
 var pass = 0, fail = 0;
@@ -189,6 +203,101 @@ async function rejects(name, fn) {
   ok('Auth.login removed', typeof Auth.login === 'undefined');
   ok('no rate limiter exposed', !Auth._internals.RateLimiter);
   ok('no crypto hasher exposed', !Auth._internals.CryptoHasher);
+
+  // 12) Bilingual product names: language detection
+  console.log('\n[bilingual: language detection]');
+  ok('detects Hebrew text', AppI.detectLang('חלב') === 'he');
+  ok('detects Latin text as en', AppI.detectLang('Milk') === 'en');
+  ok('mixed (has Hebrew) -> he', AppI.detectLang('Milk חלב') === 'he');
+  ok('empty/undefined -> en (safe default)', AppI.detectLang('') === 'en' && AppI.detectLang(undefined) === 'en');
+  ok('digits/barcode -> en', AppI.detectLang('7290000000001') === 'en');
+
+  // 13) resolveNames: catalog pick preserved; typed enriched; unknown -> fallback
+  console.log('\n[bilingual: resolveNames]');
+  var rPick = AppI.resolveNames('Ground Beef', 'Ground Beef', 'בשר טחון');
+  ok('catalog pair is preserved verbatim', rPick.nameEn === 'Ground Beef' && rPick.nameHe === 'בשר טחון');
+  var rHe = AppI.resolveNames('חלב', null, null);
+  ok('typed Hebrew fills nameHe', rHe.nameHe === 'חלב');
+  ok('typed Hebrew enriches nameEn from catalog', rHe.nameEn === 'Milk');
+  var rEn = AppI.resolveNames('Milk', null, null);
+  ok('typed English fills nameEn', rEn.nameEn === 'Milk');
+  ok('typed English enriches nameHe from catalog', rEn.nameHe === 'חלב');
+  var rUnknown = AppI.resolveNames('Zorblax Widget', null, null);
+  ok('unknown English fills only nameEn (other null for fallback)', rUnknown.nameEn === 'Zorblax Widget' && rUnknown.nameHe === null);
+  var rEmpty = AppI.resolveNames('', null, null);
+  ok('empty typed -> both null', rEmpty.nameEn === null && rEmpty.nameHe === null);
+
+  // 14) localName: language-aware display + graceful fallback
+  console.log('\n[bilingual: localName fallback]');
+  var dual = { name: 'Milk', nameEn: 'Milk', nameHe: 'חלב' };
+  I18N.setLang('he'); ok('he UI shows Hebrew name', AppI.localName(dual) === 'חלב');
+  I18N.setLang('en'); ok('en UI shows English name', AppI.localName(dual) === 'Milk');
+  var onlyHe = { name: 'חלב', nameEn: null, nameHe: 'חלב' };
+  I18N.setLang('en'); ok('en UI falls back to Hebrew when no English', AppI.localName(onlyHe) === 'חלב');
+  var legacy = { name: 'Legacy Milk' }; // pre-migration item (no nameEn/nameHe)
+  I18N.setLang('he'); ok('legacy-only renders in he (fallback)', AppI.localName(legacy) === 'Legacy Milk');
+  I18N.setLang('en'); ok('legacy-only renders in en (fallback)', AppI.localName(legacy) === 'Legacy Milk');
+  ok('null/empty object -> empty string', AppI.localName(null) === '' && AppI.localName({}) === '');
+  // Scan-session/barcode shape uses {name(en), he}
+  var sess = { name: 'Milk', he: 'חלב' };
+  I18N.setLang('he'); ok('session entry resolves he via .he', AppI.localName(sess) === 'חלב');
+  I18N.setLang('en'); ok('session entry resolves en via .name', AppI.localName(sess) === 'Milk');
+
+  // 15) Name migration: idempotent, loss-free, no duplicates
+  console.log('\n[bilingual: name migration]');
+  // Simulate the enterApp migration predicate + transform on a legacy set.
+  var invSet = [
+    { id: 'm1', name: 'Milk' },              // English legacy -> enrich he
+    { id: 'm2', name: 'חלב' },               // Hebrew legacy  -> enrich en
+    { id: 'm3', name: 'Ground Beef', nameEn: 'Ground Beef', nameHe: 'בשר טחון' }, // already bilingual
+  ];
+  function needsMigration(i) { return !i.nameEn && !i.nameHe && i.name; }
+  var pending1 = invSet.filter(needsMigration);
+  ok('only legacy items are pending (2 of 3)', pending1.length === 2);
+  pending1.forEach(function (it) {
+    var r = AppI.resolveNames(it.name, null, null);
+    it.nameEn = r.nameEn; it.nameHe = r.nameHe;
+  });
+  ok('legacy name is preserved (loss-free)', invSet[0].name === 'Milk' && invSet[1].name === 'חלב');
+  ok('English legacy gained Hebrew', invSet[0].nameEn === 'Milk' && invSet[0].nameHe === 'חלב');
+  ok('Hebrew legacy gained English', invSet[1].nameHe === 'חלב' && invSet[1].nameEn === 'Milk');
+  ok('already-bilingual item untouched', invSet[2].nameEn === 'Ground Beef' && invSet[2].nameHe === 'בשר טחון');
+  ok('re-run is a no-op (idempotent, no duplicates)', invSet.filter(needsMigration).length === 0 && invSet.length === 3);
+
+  // 16) Item schema carries both names through db.create
+  console.log('\n[bilingual: db schema]');
+  Auth.selectUser('aviraz'); DB.setUser(CurrentUser.id());
+  var createdItem = await DB.create({ name: 'Milk', nameEn: 'Milk', nameHe: 'חלב', quantity: 1, unit: 'L', categoryId: 'dairy', location: 'Fridge' });
+  ok('create persists nameEn', createdItem.nameEn === 'Milk');
+  ok('create persists nameHe', createdItem.nameHe === 'חלב');
+  var createdLegacy = await DB.create({ name: 'Salt', quantity: 1, unit: 'pack', categoryId: 'dry', location: 'Pantry' });
+  ok('create defaults missing names to null (fallback)', createdLegacy.nameEn === null && createdLegacy.nameHe === null);
+
+  // 17) Full EN/HE i18n key parity (deep) + new keys present
+  console.log('\n[i18n: full EN/HE parity]');
+  function flatten(obj, prefix, out) {
+    Object.keys(obj).forEach(function (k) {
+      var v = obj[k];
+      var key = prefix ? prefix + '.' + k : k;
+      if (v && typeof v === 'object') flatten(v, key, out);
+      else out[key] = true;
+    });
+    return out;
+  }
+  var dicts = I18N._dicts;
+  var enKeys = Object.keys(flatten(dicts.en, '', {})).sort();
+  var heKeys = Object.keys(flatten(dicts.he, '', {})).sort();
+  var missingInHe = enKeys.filter(function (k) { return heKeys.indexOf(k) === -1; });
+  var missingInEn = heKeys.filter(function (k) { return enKeys.indexOf(k) === -1; });
+  ok('every EN key exists in HE (' + missingInHe.length + ' missing)', missingInHe.length === 0);
+  ok('every HE key exists in EN (' + missingInEn.length + ' missing)', missingInEn.length === 0);
+  if (missingInHe.length) console.log('    missing in he:', missingInHe.join(', '));
+  if (missingInEn.length) console.log('    missing in en:', missingInEn.join(', '));
+  ['a11y.close', 'a11y.increase', 'a11y.decrease'].forEach(function (k) {
+    I18N.setLang('en'); var en = I18N.t(k);
+    I18N.setLang('he'); var he = I18N.t(k);
+    ok(k + ' (en+he present, non-key)', en !== k && he !== k);
+  });
 
   console.log('\n============================');
   console.log('PASS ' + pass + '  FAIL ' + fail);

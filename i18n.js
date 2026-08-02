@@ -135,6 +135,11 @@
         english: 'English',
         hebrew: 'עברית',
       },
+      a11y: {
+        close: 'Close',
+        increase: 'Increase',
+        decrease: 'Decrease',
+      },
       auth: {
         title: 'HomeStock',
         subtitle: 'Smart Home Inventory',
@@ -306,6 +311,11 @@
         english: 'English',
         hebrew: 'עברית',
       },
+      a11y: {
+        close: 'סגירה',
+        increase: 'הוספה',
+        decrease: 'הפחתה',
+      },
       auth: {
         title: 'HomeStock',
         subtitle: 'ניהול מלאי חכם לבית',
@@ -441,5 +451,7 @@
       return isRtlLang(lang);
     },
     init: init,
+    // Exposed for the automated harness's EN/HE key-parity check.
+    _dicts: dictionaries,
   };
 })();
