@@ -23,6 +23,71 @@ const GENERIC = {
   other: '🍽️',
 };
 
+// Default unit per category (used to prefill the form when a catalog item is
+// selected). Individual items can override via UNIT_OVERRIDE below.
+const UNIT_BY_CAT = {
+  produce: 'pcs',
+  fruit: 'pcs',
+  dairy: 'pack',
+  meat: 'kg',
+  bakery: 'pcs',
+  dry: 'pack',
+  frozen: 'pack',
+  drinks: 'L',
+  snacks: 'pack',
+  condiments: 'pcs',
+  other: 'pcs',
+};
+
+// Per-item default-unit overrides (English name → unit).
+const UNIT_OVERRIDE = {
+  Milk: 'L', 'Low-fat milk': 'L', 'Soy milk': 'L', 'Almond milk': 'L',
+  'Oat milk': 'L', 'Chocolate milk': 'L', Cream: 'ml', 'Sour cream': 'ml',
+  'Whipping cream': 'ml', Yogurt: 'pcs', 'Greek yogurt': 'pcs', Eggs: 'pack',
+  Water: 'L', 'Sparkling water': 'L', 'Mineral water': 'L', Cola: 'L',
+  Soda: 'L', 'Orange juice': 'L', 'Apple juice': 'L', 'Grape juice': 'L',
+  Juice: 'L', Lemonade: 'L', Coffee: 'g', Tea: 'box',
+  Flour: 'kg', Sugar: 'kg', 'Brown sugar': 'kg', Rice: 'kg', Salt: 'pack',
+  Oats: 'kg', Potato: 'kg', 'Sweet potato': 'kg', Onion: 'kg', 'Red onion': 'kg',
+  Carrot: 'kg', Cucumber: 'kg', Tomato: 'kg', 'Cherry tomato': 'pack',
+  Banana: 'kg', Apple: 'kg', 'Green apple': 'kg', Orange: 'kg', Grapes: 'kg',
+  Chicken: 'kg', 'Chicken breast': 'kg', 'Chicken thigh': 'kg', Beef: 'kg',
+  'Ground beef': 'kg', 'Ground chicken': 'kg', Steak: 'kg', Fish: 'kg',
+  Salmon: 'kg', Tuna: 'kg', 'Olive oil': 'ml', 'Vegetable oil': 'ml',
+  'Canola oil': 'ml', Vinegar: 'ml', Honey: 'g', Beer: 'pcs', Wine: 'pcs',
+};
+
+// Curated bilingual synonyms/plurals (English name → extra search terms).
+const ALIAS_OVERRIDE = {
+  Tomato: ['tomatoes', 'עגבניות'],
+  'Cherry tomato': ['cherry tomatoes', 'עגבניות שרי'],
+  Cucumber: ['cucumbers', 'מלפפונים'],
+  Onion: ['onions', 'בצלים'],
+  Potato: ['potatoes', 'תפוחי אדמה', 'תפוא'],
+  'Sweet potato': ['sweet potatoes', 'בטטות'],
+  Carrot: ['carrots', 'גזרים'],
+  Apple: ['apples', 'תפוחים'],
+  Banana: ['bananas', 'בננות'],
+  Orange: ['oranges', 'תפוזים'],
+  Egg: ['eggs', 'ביצה'],
+  Eggs: ['egg', 'ביצה'],
+  Milk: ['חלב', 'milks'],
+  Bread: ['breads', 'לחמים'],
+  Cheese: ['cheeses', 'גבינות'],
+  Yogurt: ['yoghurt', 'yogurts', 'יוגורטים'],
+  Chicken: ['chickens', 'עוף'],
+  Cola: ['coke', 'coca cola', 'קוקה קולה', 'קולה'],
+  Chocolate: ['chocolates', 'שוקולדים'],
+  Cookies: ['cookie', 'biscuits', 'עוגייה'],
+  Pepper: ['black pepper', 'פלפל'],
+  'Bell pepper': ['peppers', 'פלפלים', 'גמבה'],
+  Grapes: ['grape', 'ענב'],
+  Strawberry: ['strawberries', 'תותים'],
+  Pasta: ['pastas', 'פסטות'],
+  'Green onion': ['scallion', 'scallions', 'בצל ירוק'],
+  Lemon: ['lemons', 'לימונים'],
+};
+
 const groups = {
   fruit: [
     ['Apple', '🍎', 'תפוח'],
@@ -324,6 +389,24 @@ const groups = {
   ],
 };
 
+// Build the alias list for an entry: curated synonyms + auto EN plural/singular.
+function buildAliases(name, he) {
+  var set = {};
+  var add = function (s) {
+    if (!s) return;
+    s = String(s).trim().toLowerCase();
+    if (s) set[s] = true;
+  };
+  (ALIAS_OVERRIDE[name] || []).forEach(add);
+  var lower = name.toLowerCase();
+  if (lower.slice(-1) === 's') add(lower.slice(0, -1));
+  else add(lower + 's');
+  // Drop aliases identical to the canonical name / Hebrew name (already indexed).
+  delete set[lower];
+  if (he) delete set[he.toLowerCase()];
+  return Object.keys(set);
+}
+
 var out = [];
 var seen = {};
 Object.keys(groups).forEach(function (cat) {
@@ -334,7 +417,14 @@ Object.keys(groups).forEach(function (cat) {
     var key = name.toLowerCase();
     if (seen[key]) return; // dedupe by English name
     seen[key] = true;
-    out.push({ name: name, emoji: emoji, category: cat, he: he });
+    out.push({
+      name: name,
+      he: he,
+      emoji: emoji,
+      category: cat,
+      unit: UNIT_OVERRIDE[name] || UNIT_BY_CAT[cat] || 'pcs',
+      aliases: buildAliases(name, he),
+    });
   });
 });
 

@@ -96,6 +96,8 @@
       note: input.note || null,
       // Specific item emoji (from the food DB); null → fall back to category.
       emoji: input.emoji || null,
+      // On-device product image (compressed JPEG data URL); null → emoji.
+      image: input.image || null,
       // Desired amount / par level (target stock). 0 = not tracked.
       desiredAmount:
         typeof input.desiredAmount === 'number' ? input.desiredAmount : 0,

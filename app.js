@@ -37,27 +37,69 @@
     return item.emoji || categoryEmoji(item.categoryId);
   }
 
+  // Rounded visual for an item everywhere it appears: its on-device image if
+  // present, otherwise the emoji placeholder. Never yields a broken image.
+  function itemThumb(item, extraClass) {
+    var cls = 'badge' + (extraClass ? ' ' + extraClass : '');
+    if (item && item.image) {
+      var img = h('img', {
+        class: 'thumb-img',
+        src: item.image,
+        alt: '',
+        loading: 'lazy',
+      });
+      img.addEventListener('load', function () {
+        img.classList.add('loaded');
+      });
+      return h('div', { class: cls + ' has-img' }, img);
+    }
+    return h('div', { class: cls, text: itemEmoji(item || {}) });
+  }
+
   // ---- Local food database (autocomplete + emoji assignment) ----
   var FOODS = window.FOODS || [];
+
+  // Precompute a lowercased search index per entry: [name, he, ...aliases].
+  // Enables fast start-of-word matching across both languages + synonyms.
+  FOODS.forEach(function (f) {
+    var terms = [f.name.toLowerCase()];
+    if (f.he) terms.push(f.he.toLowerCase());
+    (f.aliases || []).forEach(function (a) {
+      if (a) terms.push(String(a).toLowerCase());
+    });
+    f._s = terms;
+  });
 
   function foodLabel(f) {
     return window.I18N.getLang() === 'he' && f.he ? f.he : f.name;
   }
 
-  // Ranked matches for the autocomplete dropdown (searches EN + HE).
+  // Best score for a query against an entry's search terms.
+  // 0 = exact, 1 = starts-with, 2 = contains, -1 = no match.
+  function scoreFood(f, q) {
+    var best = -1;
+    var terms = f._s;
+    for (var i = 0; i < terms.length; i++) {
+      var s = terms[i];
+      var sc;
+      if (s === q) sc = 0;
+      else if (s.indexOf(q) === 0) sc = 1;
+      else if (s.indexOf(q) !== -1) sc = 2;
+      else continue;
+      if (best === -1 || sc < best) best = sc;
+      if (best === 0) break;
+    }
+    return best;
+  }
+
+  // Ranked matches for the autocomplete dropdown (EN + HE + aliases).
   function foodSearch(query) {
     var q = (query || '').trim().toLowerCase();
     if (!q) return [];
     var res = [];
     for (var i = 0; i < FOODS.length; i++) {
-      var f = FOODS[i];
-      var en = f.name.toLowerCase();
-      var he = (f.he || '').toLowerCase();
-      var score = -1;
-      if (en === q || he === q) score = 0;
-      else if (en.indexOf(q) === 0 || (he && he.indexOf(q) === 0)) score = 1;
-      else if (en.indexOf(q) !== -1 || (he && he.indexOf(q) !== -1)) score = 2;
-      if (score >= 0) res.push({ f: f, score: score });
+      var sc = scoreFood(FOODS[i], q);
+      if (sc >= 0) res.push({ f: FOODS[i], score: sc });
     }
     res.sort(function (a, b) {
       return a.score - b.score || a.f.name.localeCompare(b.f.name);
@@ -67,18 +109,15 @@
     });
   }
 
-  // Best-effort exact/prefix match used to auto-assign an emoji on save.
+  // Best-effort exact/prefix match used to auto-assign emoji/unit on save.
   function foodMatch(name) {
     var q = (name || '').trim().toLowerCase();
     if (!q) return null;
     var prefix = null;
     for (var i = 0; i < FOODS.length; i++) {
-      var f = FOODS[i];
-      var en = f.name.toLowerCase();
-      var he = (f.he || '').toLowerCase();
-      if (en === q || he === q) return f;
-      if (!prefix && (en.indexOf(q) === 0 || (he && he.indexOf(q) === 0)))
-        prefix = f;
+      var sc = scoreFood(FOODS[i], q);
+      if (sc === 0) return FOODS[i];
+      if (sc === 1 && !prefix) prefix = FOODS[i];
     }
     return prefix;
   }
@@ -139,6 +178,40 @@
     return Number.isInteger(n) ? String(n) : n.toFixed(1);
   }
 
+  // Downscale + compress an uploaded image entirely on-device. Produces a
+  // small JPEG data URL (max 256px on the long edge) suitable for IndexedDB.
+  // Calls cb(dataUrl) on success or cb(null) on any failure.
+  function processImage(file, cb) {
+    var MAX = 256;
+    var reader = new FileReader();
+    reader.onerror = function () {
+      cb(null);
+    };
+    reader.onload = function () {
+      var img = new Image();
+      img.onerror = function () {
+        cb(null);
+      };
+      img.onload = function () {
+        try {
+          var scale = Math.min(1, MAX / Math.max(img.width, img.height));
+          var w = Math.max(1, Math.round(img.width * scale));
+          var hgt = Math.max(1, Math.round(img.height * scale));
+          var canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = hgt;
+          var ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, w, hgt);
+          cb(canvas.toDataURL('image/jpeg', 0.7));
+        } catch (e) {
+          cb(null);
+        }
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
   // ---- State ----
   var items = [];
   var root;
@@ -148,6 +221,7 @@
       // Normalize legacy records that predate desiredAmount.
       items = arr.map(function (i) {
         if (typeof i.desiredAmount !== 'number') i.desiredAmount = 0;
+        if (typeof i.image === 'undefined') i.image = null; // migrate legacy
         return i;
       });
     });
@@ -186,6 +260,7 @@
         return {
           id: i.id,
           name: i.name,
+          emoji: itemEmoji(i),
           missing: i.desiredAmount - i.quantity,
           have: i.quantity,
           target: i.desiredAmount,
@@ -405,7 +480,7 @@
           openForm(item);
         },
       },
-      h('div', { class: 'badge', text: itemEmoji(item) }),
+      itemThumb(item),
       h(
         'div',
         { class: 'card-info' },
@@ -425,7 +500,7 @@
           openForm(item);
         },
       },
-      h('div', { class: 'badge', text: itemEmoji(item) }),
+      itemThumb(item),
       h(
         'div',
         { class: 'card-info' },
@@ -487,6 +562,7 @@
       desiredAmount: editing ? existing.desiredAmount || 0 : 0,
       barcode: editing ? existing.barcode || null : prefill.barcode || null,
       emoji: editing ? existing.emoji || null : prefill.emoji || null,
+      image: editing ? existing.image || null : prefill.image || null,
     };
 
     var overlay = h('div', { class: 'overlay' });
@@ -514,6 +590,68 @@
 
     var body = h('div', { class: 'sheet-body' });
 
+    // Photo — on-device image with emoji placeholder fallback.
+    body.appendChild(h('label', { class: 'field-label', text: t('form.photo') }));
+    var fileInput = h('input', {
+      class: 'photo-file',
+      type: 'file',
+      accept: 'image/*',
+    });
+    var photoRow = h('div', { class: 'photo-row' });
+    function renderPhoto() {
+      photoRow.innerHTML = '';
+      var tile = state.image
+        ? h(
+            'div',
+            { class: 'photo-preview has-img' },
+            h('img', { class: 'thumb-img loaded', src: state.image, alt: '' })
+          )
+        : h(
+            'div',
+            { class: 'photo-preview' },
+            h('span', {
+              text: state.emoji || categoryEmoji(state.categoryId),
+            })
+          );
+      var addBtn = h(
+        'button',
+        { class: 'btn ghost', type: 'button', onclick: function () { fileInput.click(); } },
+        state.image ? t('form.changePhoto') : t('form.addPhoto')
+      );
+      var removeBtn = state.image
+        ? h(
+            'button',
+            {
+              class: 'btn ghost danger',
+              type: 'button',
+              onclick: function () {
+                state.image = null;
+                renderPhoto();
+              },
+            },
+            t('form.removePhoto')
+          )
+        : null;
+      photoRow.appendChild(tile);
+      photoRow.appendChild(h('div', { class: 'photo-actions' }, addBtn, removeBtn));
+    }
+    fileInput.addEventListener('change', function () {
+      var file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      processImage(file, function (dataUrl) {
+        if (dataUrl) {
+          state.image = dataUrl;
+          renderPhoto();
+        } else {
+          showToast(t('form.imageError'));
+        }
+        fileInput.value = '';
+      });
+    });
+    renderPhoto();
+    body.appendChild(photoRow);
+    body.appendChild(fileInput);
+
     // Name + autocomplete
     var nameInput = h('input', {
       class: 'input',
@@ -529,7 +667,7 @@
     var suggestions = [];
     var activeIdx = -1;
 
-    // Applies a chosen food: fills name, emoji, and category.
+    // Applies a chosen food: fills name, emoji, category, and default unit.
     function applyFood(f) {
       nameInput.value = foodLabel(f);
       state.name = nameInput.value;
@@ -541,6 +679,15 @@
             'chip' + (CATEGORIES[idx].id === f.category ? ' active' : '');
         });
       }
+      if (f.unit && UNITS.indexOf(f.unit) !== -1) {
+        state.unit = f.unit;
+        if (qtyUnit) qtyUnit.textContent = t('units.' + f.unit);
+        if (unitChips)
+          Array.prototype.forEach.call(unitChips.children, function (c, idx) {
+            c.className = 'chip unit' + (UNITS[idx] === f.unit ? ' active' : '');
+          });
+      }
+      renderPhoto();
       closeAc();
     }
 
@@ -673,6 +820,7 @@
                 c.className =
                   'chip' + (CATEGORIES[idx].id === cat.id ? ' active' : '');
               });
+              renderPhoto(); // placeholder emoji tracks the category
             },
           },
           h('span', { text: cat.emoji }),
@@ -842,6 +990,7 @@
         desiredAmount: state.desiredAmount,
         barcode: state.barcode,
         emoji: emoji || null,
+        image: state.image || null,
       };
       var p;
       if (editing) {
@@ -1040,11 +1189,21 @@
       } else {
         var ul = h('div', { class: 'monthly-list' });
         shortfall.forEach(function (s) {
+          // Use the live item's thumb when available, else the snapshot emoji.
+          var live = itemById(s.id);
+          var thumb = live
+            ? itemThumb(live, 'sm')
+            : h('div', { class: 'badge sm', text: s.emoji || '🍽️' });
           ul.appendChild(
             h(
               'div',
               { class: 'monthly-item' },
-              h('span', { class: 'monthly-item-name', text: s.name }),
+              h(
+                'div',
+                { class: 'monthly-item-main' },
+                thumb,
+                h('span', { class: 'monthly-item-name', text: s.name })
+              ),
               h('span', {
                 class: 'monthly-item-miss',
                 text: t('restock.missing', {

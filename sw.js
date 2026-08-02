@@ -1,6 +1,6 @@
 /* Service worker: precache + cache-first, offline-capable, self-updating.
    Bump VERSION on every deploy to trigger an update for installed PWAs. */
-var VERSION = 'v1.2.0';
+var VERSION = 'v1.3.0';
 var CACHE = 'pantry-' + VERSION;
 
 var ASSETS = [
