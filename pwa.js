@@ -5,7 +5,7 @@
 
   // Fallback shown before the SW reports its authoritative VERSION.
   // Keep in sync with sw.js on deploy; the SW value overrides this at runtime.
-  var FALLBACK_VERSION = 'v1.4.0';
+  var FALLBACK_VERSION = 'v1.6.0';
   window.APP_VERSION = FALLBACK_VERSION;
 
   function setVersion(v) {

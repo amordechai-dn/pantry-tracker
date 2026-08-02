@@ -25,7 +25,9 @@
   <body>
     <div id="root"></div>
 
-    <script src="./vendor/zxing.min.js"></script>
+    <!-- vendor/zxing.min.js (~336KB) is NOT loaded here: it is lazy-loaded on
+         first scanner open (see loadZXing in app.js) and precached by the SW so
+         it still resolves from cache offline, keeping it off the startup path. -->
     <script src="./data/foods.js"></script>
     <script src="./i18n.js"></script>
     <script src="./db.js"></script>

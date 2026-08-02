@@ -1,8 +1,12 @@
 /* Service worker: precache + cache-first, offline-capable, self-updating.
    Bump VERSION on every deploy to trigger an update for installed PWAs. */
-var VERSION = 'v1.4.0';
+var VERSION = 'v1.6.0';
 var CACHE = 'pantry-' + VERSION;
 
+// Critical-path assets for first paint + full offline. Kept lean: only what
+// the app needs to boot and run offline. Runtime API responses (Open Food
+// Facts lookups) are NOT cached here — they are persisted per-user in the
+// IndexedDB `barcodes` store, so there is no duplicate/redundant caching.
 var ASSETS = [
   './',
   './index.html',
@@ -12,6 +16,8 @@ var ASSETS = [
   './auth.js',
   './app.js',
   './pwa.js',
+  // Scanner library: precached so the lazy load (on first scanner open) still
+  // resolves from cache offline, but it is NOT on the startup/parse path.
   './vendor/zxing.min.js',
   './data/foods.js',
   './manifest.webmanifest',

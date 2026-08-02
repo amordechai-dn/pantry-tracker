@@ -41,10 +41,11 @@
   // present, otherwise the emoji placeholder. Never yields a broken image.
   function itemThumb(item, extraClass) {
     var cls = 'badge' + (extraClass ? ' ' + extraClass : '');
-    if (item && item.image) {
+    var src = thumbImageFor(item);
+    if (src) {
       var img = h('img', {
         class: 'thumb-img',
-        src: item.image,
+        src: src,
         alt: '',
         loading: 'lazy',
       });
@@ -54,6 +55,16 @@
       return h('div', { class: cls + ' has-img' }, img);
     }
     return h('div', { class: cls, text: itemEmoji(item || {}) });
+  }
+
+  // Current user's avatar (image) or an initials tile. Used in header/profile.
+  function avatarEl(extraClass) {
+    var cls = 'avatar' + (extraClass ? ' ' + extraClass : '');
+    var av = window.CurrentUser && window.CurrentUser.avatar();
+    if (av) {
+      return h('div', { class: cls + ' has-img' }, h('img', { class: 'avatar-img', src: av, alt: '' }));
+    }
+    return h('div', { class: cls, text: window.CurrentUser ? window.CurrentUser.initials() : '?' });
   }
 
   // ---- Local food database (autocomplete + emoji assignment) ----
@@ -178,11 +189,63 @@
     return Number.isInteger(n) ? String(n) : n.toFixed(1);
   }
 
-  // Downscale + compress an uploaded image entirely on-device. Produces a
-  // small JPEG data URL (max 256px on the long edge) suitable for IndexedDB.
-  // Calls cb(dataUrl) on success or cb(null) on any failure.
+  // ---- Image pipeline (on-device compression, WebP-preferred, deduped) ----
+  // Two resolutions are produced per image: a FULL variant for detail/edit and
+  // a small THUMB variant for lists/cards. Encoding prefers WebP when the
+  // browser supports it (much smaller than JPEG at equal quality) and falls
+  // back to JPEG otherwise. Nothing leaves the device.
+  var IMG_FULL_MAX = 512; // long-edge px for detail/edit resolution
+  var IMG_THUMB_MAX = 96; // long-edge px for list/card resolution
+
+  // Feature-detect WebP canvas export once and cache the result.
+  var _webpOk = null;
+  function webpSupported() {
+    if (_webpOk !== null) return _webpOk;
+    try {
+      var c = document.createElement('canvas');
+      c.width = 1;
+      c.height = 1;
+      _webpOk = c.toDataURL('image/webp').indexOf('data:image/webp') === 0;
+    } catch (e) {
+      _webpOk = false;
+    }
+    return _webpOk;
+  }
+
+  function encodeCanvas(canvas, quality) {
+    if (webpSupported()) {
+      var w = canvas.toDataURL('image/webp', quality);
+      if (w.indexOf('data:image/webp') === 0) return w;
+    }
+    return canvas.toDataURL('image/jpeg', quality);
+  }
+
+  function scaleToCanvas(img, max) {
+    var scale = Math.min(1, max / Math.max(img.width, img.height));
+    var w = Math.max(1, Math.round(img.width * scale));
+    var hgt = Math.max(1, Math.round(img.height * scale));
+    var canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = hgt;
+    canvas.getContext('2d').drawImage(img, 0, 0, w, hgt);
+    return canvas;
+  }
+
+  // Produce { full, thumb } data URLs from a loaded <img>. Returns null on error.
+  function variantsFromImage(img) {
+    try {
+      return {
+        full: encodeCanvas(scaleToCanvas(img, IMG_FULL_MAX), 0.72),
+        thumb: encodeCanvas(scaleToCanvas(img, IMG_THUMB_MAX), 0.7),
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Compress an uploaded File/Blob entirely on-device. Calls cb({full,thumb})
+  // on success or cb(null) on any failure.
   function processImage(file, cb) {
-    var MAX = 256;
     var reader = new FileReader();
     reader.onerror = function () {
       cb(null);
@@ -193,39 +256,190 @@
         cb(null);
       };
       img.onload = function () {
-        try {
-          var scale = Math.min(1, MAX / Math.max(img.width, img.height));
-          var w = Math.max(1, Math.round(img.width * scale));
-          var hgt = Math.max(1, Math.round(img.height * scale));
-          var canvas = document.createElement('canvas');
-          canvas.width = w;
-          canvas.height = hgt;
-          var ctx = canvas.getContext('2d');
-          ctx.drawImage(img, 0, 0, w, hgt);
-          cb(canvas.toDataURL('image/jpeg', 0.7));
-        } catch (e) {
-          cb(null);
-        }
+        cb(variantsFromImage(img));
       };
       img.src = reader.result;
     };
     reader.readAsDataURL(file);
   }
 
+  // Derive { full, thumb } from an existing data URL (used by the OFF/scanner
+  // paths and the one-time inline-image migration). cb(null) on failure.
+  function variantsFromDataUrl(dataUrl, cb) {
+    if (!dataUrl) return cb(null);
+    var img = new Image();
+    img.onerror = function () {
+      cb(null);
+    };
+    img.onload = function () {
+      cb(variantsFromImage(img));
+    };
+    img.src = dataUrl;
+  }
+
+  // ---- Content-hash image de-duplication (per-user, shared image store) ----
+  // Images are keyed by the SHA-256 of their full data URL, so an identical
+  // photo used by many items is stored exactly once (dedup-on-write). Items
+  // reference an image via item.imageHash. An in-memory map mirrors the store
+  // so cards/lists render synchronously without per-item async reads.
+  var imageMap = {}; // hash -> { hash, full, thumb }
+
+  function sha256Hex(str) {
+    try {
+      if (window.crypto && window.crypto.subtle && window.TextEncoder) {
+        var bytes = new TextEncoder().encode(str);
+        return window.crypto.subtle
+          .digest('SHA-256', bytes)
+          .then(function (buf) {
+            var arr = Array.prototype.slice.call(new Uint8Array(buf));
+            return arr
+              .map(function (b) {
+                return b.toString(16).padStart(2, '0');
+              })
+              .join('');
+          });
+      }
+    } catch (e) {}
+    // Deterministic non-crypto fallback (still fine for dedup keying).
+    var h = 5381;
+    var i = str.length;
+    while (i) h = (h * 33) ^ str.charCodeAt(--i);
+    return Promise.resolve('f' + (h >>> 0).toString(16));
+  }
+
+  // Store a { full, thumb } pair de-duplicated by content hash; return the hash.
+  function storeImagePair(pair) {
+    if (!pair || !pair.full) return Promise.resolve(null);
+    return sha256Hex(pair.full).then(function (hash) {
+      if (imageMap[hash]) return hash; // already stored (dedup-on-write)
+      var rec = { hash: hash, full: pair.full, thumb: pair.thumb || pair.full };
+      imageMap[hash] = rec;
+      return window.PantryDB.putImage(rec).then(function () {
+        return hash;
+      });
+    });
+  }
+
+  // Persist an image given only a FULL data URL: derive a thumb, then dedup.
+  function persistFullImage(full) {
+    if (!full) return Promise.resolve(null);
+    return new Promise(function (resolve) {
+      variantsFromDataUrl(full, function (pair) {
+        if (!pair) return resolve(null);
+        storeImagePair(pair).then(resolve);
+      });
+    });
+  }
+
+  // Release an image when no remaining item references it (refcount-by-scan GC).
+  function releaseImage(hash) {
+    if (!hash) return Promise.resolve();
+    var stillUsed = items.some(function (it) {
+      return it.imageHash === hash;
+    });
+    if (stillUsed) return Promise.resolve();
+    delete imageMap[hash];
+    return window.PantryDB.deleteImage(hash);
+  }
+
+  // Resolve display sources for an item: hashed store first, then any legacy
+  // inline image (pre-migration / scanner-session entries that carry .image).
+  function fullImageFor(item) {
+    if (!item) return null;
+    if (item.imageHash && imageMap[item.imageHash])
+      return imageMap[item.imageHash].full;
+    return item.image || null;
+  }
+  function thumbImageFor(item) {
+    if (!item) return null;
+    if (item.imageHash && imageMap[item.imageHash]) {
+      var r = imageMap[item.imageHash];
+      return r.thumb || r.full;
+    }
+    return item.image || null;
+  }
+
+  // One-time migration: move any legacy inline item.image into the deduped
+  // image store, set item.imageHash, and drop the inline copy. Per-user flag,
+  // idempotent, and safe if interrupted (re-runs only over items still inline).
+  function migrateInlineImages() {
+    var uid = window.CurrentUser && window.CurrentUser.id();
+    if (!uid) return Promise.resolve();
+    var FLAG = 'pantry.imgmig.v1.' + uid;
+    try {
+      if (localStorage.getItem(FLAG)) return Promise.resolve();
+    } catch (e) {}
+    var pending = items.filter(function (i) {
+      return i.image && !i.imageHash;
+    });
+    if (!pending.length) {
+      try {
+        localStorage.setItem(FLAG, '1');
+      } catch (e) {}
+      return Promise.resolve();
+    }
+    var chain = Promise.resolve();
+    pending.forEach(function (it) {
+      chain = chain.then(function () {
+        return persistFullImage(it.image).then(function (hash) {
+          // Only drop the inline copy once it is safely deduped — never lose it.
+          if (!hash) return;
+          it.imageHash = hash;
+          it.image = null;
+          return window.PantryDB.put(it);
+        });
+      });
+    });
+    return chain.then(function () {
+      try {
+        localStorage.setItem(FLAG, '1');
+      } catch (e) {}
+    });
+  }
+
+  // ---- Lazy scanner library loader (ZXing, ~336KB) ----
+  // Loaded only on first scanner open — kept off the startup/parse path. The
+  // service worker precaches vendor/zxing.min.js, so this resolves from cache
+  // offline too. Debounced via a single shared promise so it loads once.
+  var zxingPromise = null;
+  function loadZXing() {
+    if (typeof ZXing !== 'undefined') return Promise.resolve(ZXing);
+    if (zxingPromise) return zxingPromise;
+    zxingPromise = new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = './vendor/zxing.min.js';
+      s.async = true;
+      s.onload = function () {
+        if (typeof ZXing !== 'undefined') resolve(ZXing);
+        else {
+          zxingPromise = null;
+          reject(new Error('ZXing unavailable after load'));
+        }
+      };
+      s.onerror = function () {
+        zxingPromise = null; // allow a retry on the next scanner open
+        reject(new Error('Failed to load scanner library'));
+      };
+      document.head.appendChild(s);
+    });
+    return zxingPromise;
+  }
+
   // ---- Reusable form controls (shared by add/edit form + scanner dialogs) ----
 
-  // On-device photo control. `state` is mutated in place (state.image); the
-  // placeholder falls back to state.emoji or the category emoji.
+  // On-device photo control. `state` is mutated in place (state.imageFull /
+  // state.imageThumb); the placeholder falls back to state.emoji or category.
   function photoControl(state) {
     var fileInput = h('input', { class: 'photo-file', type: 'file', accept: 'image/*' });
     var row = h('div', { class: 'photo-row' });
     function render() {
       row.innerHTML = '';
-      var tile = state.image
+      var preview = state.imageThumb || state.imageFull;
+      var tile = preview
         ? h(
             'div',
             { class: 'photo-preview has-img' },
-            h('img', { class: 'thumb-img loaded', src: state.image, alt: '' })
+            h('img', { class: 'thumb-img loaded', src: preview, alt: '' })
           )
         : h(
             'div',
@@ -235,15 +449,15 @@
       var addBtn = h(
         'button',
         { class: 'btn ghost', type: 'button', onclick: function () { fileInput.click(); } },
-        state.image ? t('form.changePhoto') : t('form.addPhoto')
+        preview ? t('form.changePhoto') : t('form.addPhoto')
       );
-      var rm = state.image
+      var rm = preview
         ? h(
             'button',
             {
               class: 'btn ghost danger',
               type: 'button',
-              onclick: function () { state.image = null; render(); },
+              onclick: function () { state.imageFull = null; state.imageThumb = null; render(); },
             },
             t('form.removePhoto')
           )
@@ -254,8 +468,8 @@
     fileInput.addEventListener('change', function () {
       var f = fileInput.files && fileInput.files[0];
       if (!f) return;
-      processImage(f, function (dataUrl) {
-        if (dataUrl) { state.image = dataUrl; render(); }
+      processImage(f, function (pair) {
+        if (pair) { state.imageFull = pair.full; state.imageThumb = pair.thumb; render(); }
         else showToast(t('form.imageError'));
         fileInput.value = '';
       });
@@ -335,14 +549,25 @@
   var root;
 
   function load() {
-    return window.PantryDB.getAll().then(function (arr) {
-      // Normalize legacy records that predate desiredAmount.
-      items = arr.map(function (i) {
-        if (typeof i.desiredAmount !== 'number') i.desiredAmount = 0;
-        if (typeof i.image === 'undefined') i.image = null; // migrate legacy
-        return i;
+    return window.PantryDB.getAll()
+      .then(function (arr) {
+        // Normalize legacy records that predate desiredAmount.
+        items = arr.map(function (i) {
+          if (typeof i.desiredAmount !== 'number') i.desiredAmount = 0;
+          if (typeof i.image === 'undefined') i.image = null; // migrate legacy
+          return i;
+        });
+      })
+      .then(function () {
+        // Hydrate the in-memory image cache so cards render synchronously.
+        return window.PantryDB.getAllImages();
+      })
+      .then(function (imgs) {
+        imageMap = {};
+        (imgs || []).forEach(function (r) {
+          if (r && r.hash) imageMap[r.hash] = r;
+        });
       });
-    });
   }
 
   // ================= Monthly restock tracking =================
@@ -392,6 +617,32 @@
     window.PantryDB.setMonthlyLog(log);
   }
 
+  // Targeted-render caches: the DOM node per item id + the "To restock" section
+  // container. A quantity change updates only the affected card (O(1)) and
+  // rebuilds just the restock section (O(shortfall)) instead of re-rendering
+  // the entire list (O(n)) on every tap.
+  var cardRefs = {};
+  var restockSectionEl = null;
+
+  // (Re)build the "To restock" section into its container.
+  function renderRestockInto(container) {
+    container.innerHTML = '';
+    var shortfall = computeShortfall();
+    if (!shortfall.length) return;
+    container.appendChild(
+      h(
+        'div',
+        { class: 'section-header' },
+        h('span', { class: 'section-emoji', text: '🛒' }),
+        h('span', { class: 'section-title', text: t('restock.title') }),
+        h('span', { class: 'section-count', text: String(shortfall.length) })
+      )
+    );
+    shortfall.forEach(function (s) {
+      container.appendChild(renderRestockCard(itemById(s.id), s));
+    });
+  }
+
   // ---- Rendering (main screen) ----
   function renderMain() {
     if (!root) root = document.getElementById('root');
@@ -423,7 +674,8 @@
       {
         class: 'lang-btn',
         'aria-label': t('language.a11y'),
-        onclick: openLang,
+        // Wrap so the click event isn't passed as the re-render callback.
+        onclick: function () { openLang(renderMain); },
       },
       '🌐 ' + (window.I18N.getLang() === 'he' ? 'עב' : 'EN')
     );
@@ -437,15 +689,15 @@
       },
       '📅'
     );
-    var logoutBtn = h(
+    var profileBtn = h(
       'button',
       {
-        class: 'icon-btn',
-        'aria-label': t('auth.logout'),
-        title: t('auth.logout'),
-        onclick: doLogout,
+        class: 'icon-btn profile-btn',
+        'aria-label': t('auth.profile'),
+        title: window.CurrentUser ? window.CurrentUser.displayName() : t('auth.profile'),
+        onclick: openProfile,
       },
-      '🚪'
+      avatarEl('sm')
     );
 
     var header = h(
@@ -460,7 +712,7 @@
       h(
         'div',
         { class: 'header-actions' },
-        h('div', { class: 'header-btn-row' }, monthlyBtn, langBtn, logoutBtn),
+        h('div', { class: 'header-btn-row' }, monthlyBtn, langBtn, profileBtn),
         h('span', { class: 'version', id: 'version', text: window.APP_VERSION || '' })
       )
     );
@@ -480,23 +732,12 @@
     } else {
       var list = h('div', { class: 'list' });
 
-      // "To restock" section (items below their desired amount).
-      var shortfall = computeShortfall();
-      if (shortfall.length > 0) {
-        list.appendChild(
-          h(
-            'div',
-            { class: 'section-header' },
-            h('span', { class: 'section-emoji', text: '🛒' }),
-            h('span', { class: 'section-title', text: t('restock.title') }),
-            h('span', { class: 'section-count', text: String(shortfall.length) })
-          )
-        );
-        shortfall.forEach(function (s) {
-          var item = itemById(s.id);
-          list.appendChild(renderRestockCard(item, s));
-        });
-      }
+      // "To restock" section — kept in its own container so quantity changes
+      // can rebuild just this section without touching the rest of the list.
+      cardRefs = {};
+      restockSectionEl = h('div', { class: 'restock-section' });
+      renderRestockInto(restockSectionEl);
+      list.appendChild(restockSectionEl);
 
       sections.forEach(function (s) {
         list.appendChild(
@@ -512,7 +753,9 @@
           )
         );
         s.data.forEach(function (item) {
-          list.appendChild(renderCard(item));
+          var card = renderCard(item);
+          cardRefs[item.id] = card; // for targeted qty updates
+          list.appendChild(card);
         });
       });
       root.appendChild(list);
@@ -662,10 +905,21 @@
     var before = item.quantity;
     item.quantity = Math.max(0, item.quantity + delta);
     var real = item.quantity - before;
+    if (!real) return; // e.g. minus at 0 — nothing to persist or re-render
     window.PantryDB.put(item);
-    if (real) recordDelta(real);
+    recordDelta(real);
     recomputeShortfall();
-    renderMain();
+    // Targeted update: replace just this item's card (O(1)) and rebuild only
+    // the "To restock" section (O(shortfall)), avoiding a full list re-render.
+    var node = cardRefs[item.id];
+    if (node && node.parentNode) {
+      var fresh = renderCard(item);
+      cardRefs[item.id] = fresh;
+      node.parentNode.replaceChild(fresh, node);
+      if (restockSectionEl) renderRestockInto(restockSectionEl);
+    } else {
+      renderMain(); // fallback if the list isn't currently built
+    }
   }
 
   function refresh() {
@@ -690,7 +944,9 @@
       desiredAmount: editing ? existing.desiredAmount || 0 : 0,
       barcode: editing ? existing.barcode || null : prefill.barcode || null,
       emoji: editing ? existing.emoji || null : prefill.emoji || null,
-      image: editing ? existing.image || null : prefill.image || null,
+      // Deduped image: full for detail/edit, thumb for the preview tile.
+      imageFull: editing ? fullImageFor(existing) : prefill.imageFull || prefill.image || null,
+      imageThumb: editing ? thumbImageFor(existing) : prefill.imageThumb || prefill.image || null,
     };
 
     var overlay = h('div', { class: 'overlay' });
@@ -1055,35 +1311,49 @@
             state.categoryId = m.category;
         }
       }
-      var payload = {
-        name: name,
-        quantity: state.quantity,
-        unit: state.unit,
-        categoryId: state.categoryId,
-        location: state.location,
-        note: noteInput.value.trim() || null,
-        desiredAmount: state.desiredAmount,
-        barcode: state.barcode,
-        emoji: emoji || null,
-        image: state.image || null,
-      };
-      var p;
-      if (editing) {
-        Object.keys(payload).forEach(function (k) {
-          existing[k] = payload[k];
-        });
-        p = window.PantryDB.put(existing);
-      } else {
-        p = window.PantryDB.create(payload).then(function (item) {
-          // Adding a new item counts as restocking that quantity.
-          if (item.quantity) recordDelta(item.quantity);
-          return item;
+      function finalize(imageHash) {
+        var payload = {
+          name: name,
+          quantity: state.quantity,
+          unit: state.unit,
+          categoryId: state.categoryId,
+          location: state.location,
+          note: noteInput.value.trim() || null,
+          desiredAmount: state.desiredAmount,
+          barcode: state.barcode,
+          emoji: emoji || null,
+          imageHash: imageHash || null,
+        };
+        var p;
+        if (editing) {
+          var prevHash = existing.imageHash || null;
+          Object.keys(payload).forEach(function (k) {
+            existing[k] = payload[k];
+          });
+          existing.image = null; // drop any legacy inline copy
+          p = window.PantryDB.put(existing).then(function () {
+            // GC the previous image if this was its last reference.
+            if (prevHash && prevHash !== imageHash) return releaseImage(prevHash);
+          });
+        } else {
+          p = window.PantryDB.create(payload).then(function (item) {
+            // Adding a new item counts as restocking that quantity.
+            if (item.quantity) recordDelta(item.quantity);
+            return item;
+          });
+        }
+        p.then(function () {
+          close();
+          refresh();
         });
       }
-      p.then(function () {
-        close();
-        refresh();
-      });
+
+      // Persist the (possibly new/unchanged) image first, deduped by hash.
+      if (state.imageFull) {
+        storeImagePair({ full: state.imageFull, thumb: state.imageThumb }).then(finalize);
+      } else {
+        finalize(null);
+      }
     }
 
     sheet.appendChild(
@@ -1394,8 +1664,9 @@
           .then(function (blob) {
             if (!blob) return resolve(null);
             // processImage accepts any Blob; the data URL is same-origin so the
-            // canvas is not tainted and export succeeds.
-            processImage(blob, function (dataUrl) { resolve(dataUrl || null); });
+            // canvas is not tainted and export succeeds. We keep the full
+            // variant here; the thumb is derived when it is persisted/deduped.
+            processImage(blob, function (pair) { resolve(pair ? pair.full : null); });
           })
           .catch(function () { resolve(null); });
       } catch (e) {
@@ -1460,16 +1731,48 @@
   }
 
   function openScanner() {
-    // No camera / library support → straight to manual entry.
-    if (
-      typeof ZXing === 'undefined' ||
-      !navigator.mediaDevices ||
-      !navigator.mediaDevices.getUserMedia
-    ) {
+    // No camera support → straight to manual entry (no need to load ZXing).
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       openForm(null, { prefill: {} });
       return;
     }
+    // Lazy-load the scanner library on first open, showing a small loading
+    // indicator. If it fails (e.g. offline before it was ever cached), fall
+    // back to manual entry. Debounced via loadZXing's shared promise.
+    if (typeof ZXing !== 'undefined') {
+      startScanner();
+      return;
+    }
+    var aborted = false;
+    var loader = h(
+      'div',
+      { class: 'overlay scanner center' },
+      h(
+        'div',
+        { class: 'scan-loading' },
+        h('div', { class: 'scan-spinner' }),
+        h('div', { class: 'scan-loading-text', text: t('scan.loading') })
+      )
+    );
+    loader.addEventListener('click', function (e) {
+      if (e.target === loader) { aborted = true; loader.remove(); }
+    });
+    document.body.appendChild(loader);
+    loadZXing()
+      .then(function () {
+        if (loader.parentNode) loader.remove();
+        if (!aborted) startScanner();
+      })
+      .catch(function () {
+        if (loader.parentNode) loader.remove();
+        if (aborted) return;
+        showToast(t('scan.loadError'));
+        openForm(null, { prefill: {} });
+      });
+  }
 
+  // Builds and runs the camera scanner UI. Assumes ZXing is loaded.
+  function startScanner() {
     var continuous = false;
     var session = []; // grouped entries: {barcode,name,he,image,emoji,categoryId,unit,count,itemId,source}
     var byKey = {};
@@ -1637,7 +1940,7 @@
         if (local && local.source === 'inventory') {
           var it = local.item;
           addToSession({
-            barcode: code, name: it.name, image: it.image, emoji: it.emoji,
+            barcode: code, name: it.name, image: thumbImageFor(it), emoji: it.emoji,
             categoryId: it.categoryId, unit: it.unit, itemId: it.id, source: 'inventory',
           });
           return;
@@ -1730,17 +2033,22 @@
             return window.PantryDB.put(existing).then(function () { recordDelta(e.count); });
           }
           var nm = e.name || e.he || t('scan.unknownName');
-          return window.PantryDB.create({
-            name: nm, quantity: e.count, unit: e.unit, categoryId: e.categoryId,
-            location: 'Pantry', barcode: e.barcode, emoji: e.emoji, image: e.image || null,
-          }).then(function (item) {
-            recordDelta(item.quantity);
-            return window.PantryDB.putBarcode({
-              barcode: e.barcode, name: e.name || '', he: e.he || '',
-              categoryId: e.categoryId, unit: e.unit, image: e.image || null,
-              emoji: e.emoji || null, source: e.source || 'user',
+          // Dedup the image into the shared store first, then reference by hash.
+          return persistFullImage(e.image)
+            .then(function (imageHash) {
+              return window.PantryDB.create({
+                name: nm, quantity: e.count, unit: e.unit, categoryId: e.categoryId,
+                location: 'Pantry', barcode: e.barcode, emoji: e.emoji, imageHash: imageHash || null,
+              });
+            })
+            .then(function (item) {
+              recordDelta(item.quantity);
+              return window.PantryDB.putBarcode({
+                barcode: e.barcode, name: e.name || '', he: e.he || '',
+                categoryId: e.categoryId, unit: e.unit, image: e.image || null,
+                emoji: e.emoji || null, source: e.source || 'user',
+              });
             });
-          });
         });
       });
       chain.then(function () {
@@ -1811,7 +2119,9 @@
       unit: product.unit || 'pcs',
       qty: 1,
       emoji: product.emoji || null,
-      image: product.image || null,
+      // Full image from OFF/cache; thumb (if any) is set when a photo is picked.
+      imageFull: product.image || null,
+      imageThumb: null,
     };
 
     var overlay = h('div', { class: 'overlay' });
@@ -1880,26 +2190,37 @@
         var m = foodMatch(en || he);
         if (m) emoji = m.emoji;
       }
-      var existing = itemByBarcode(barcode);
-      var p;
-      if (existing) {
-        existing.quantity += st.qty;
-        if (st.image) existing.image = st.image;
-        p = window.PantryDB.put(existing).then(function () { recordDelta(st.qty); });
-      } else {
-        p = window.PantryDB.create({
-          name: primary, quantity: st.qty, unit: st.unit, categoryId: st.categoryId,
-          location: 'Pantry', barcode: barcode, emoji: emoji || null, image: st.image || null,
-        }).then(function (item) { recordDelta(item.quantity); });
-      }
-      p.then(function () {
-        window.PantryDB.putBarcode({
-          barcode: barcode, name: en, he: he, categoryId: st.categoryId,
-          unit: st.unit, image: st.image || null, emoji: emoji || null,
-          brand: product.brand || '', size: product.size || '',
-          source: opts.isNew ? 'user' : product.source || 'off',
+      // Dedup the image into the shared store first (prefer an explicit thumb
+      // from a user upload; otherwise derive one from the full image).
+      var imgP = st.imageThumb
+        ? storeImagePair({ full: st.imageFull, thumb: st.imageThumb })
+        : persistFullImage(st.imageFull);
+      imgP.then(function (imageHash) {
+        var existing = itemByBarcode(barcode);
+        var p;
+        if (existing) {
+          existing.quantity += st.qty;
+          var prevHash = existing.imageHash || null;
+          if (imageHash) { existing.imageHash = imageHash; existing.image = null; }
+          p = window.PantryDB.put(existing).then(function () {
+            recordDelta(st.qty);
+            if (imageHash && prevHash && prevHash !== imageHash) return releaseImage(prevHash);
+          });
+        } else {
+          p = window.PantryDB.create({
+            name: primary, quantity: st.qty, unit: st.unit, categoryId: st.categoryId,
+            location: 'Pantry', barcode: barcode, emoji: emoji || null, imageHash: imageHash || null,
+          }).then(function (item) { recordDelta(item.quantity); });
+        }
+        p.then(function () {
+          window.PantryDB.putBarcode({
+            barcode: barcode, name: en, he: he, categoryId: st.categoryId,
+            unit: st.unit, image: st.imageFull || null, emoji: emoji || null,
+            brand: product.brand || '', size: product.size || '',
+            source: opts.isNew ? 'user' : product.source || 'off',
+          });
+          close(true);
         });
-        close(true);
       });
     }
 
@@ -1915,7 +2236,8 @@
   }
 
   // ---- Login screen (shown when no user is signed in) ----
-  function renderLogin() {
+  function renderLogin(opts) {
+    opts = opts || {};
     if (!root) root = document.getElementById('root');
     // Clear any leftover overlays/sheets and the main UI.
     Array.prototype.slice
@@ -1923,41 +2245,105 @@
       .forEach(function (o) { o.remove(); });
     root.innerHTML = '';
 
-    var langBtn = h(
-      'button',
-      {
-        class: 'lang-btn',
-        'aria-label': t('language.a11y'),
-        onclick: function () { openLang(renderLogin); },
-      },
-      '🌐 ' + (window.I18N.getLang() === 'he' ? 'עב' : 'EN')
-    );
+    // Language selector (before login) — segmented EN / עברית.
+    var langSel = h('div', { class: 'segment auth-lang' });
+    [['en', 'English'], ['he', 'עברית']].forEach(function (pair) {
+      langSel.appendChild(
+        h(
+          'button',
+          {
+            class: 'segment-item' + (window.I18N.getLang() === pair[0] ? ' active' : ''),
+            type: 'button',
+            onclick: function () {
+              if (window.I18N.getLang() !== pair[0]) {
+                window.I18N.setLang(pair[0]);
+                renderLogin(opts);
+              }
+            },
+          },
+          pair[1]
+        )
+      );
+    });
 
     var userInput = h('input', {
       class: 'input', type: 'text', placeholder: t('auth.usernamePlaceholder'),
+      'aria-label': t('auth.username'),
       autocomplete: 'username', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false',
     });
+
+    // Password field with show/hide toggle.
     var passInput = h('input', {
       class: 'input', type: 'password', placeholder: t('auth.passwordPlaceholder'),
-      autocomplete: 'current-password',
+      'aria-label': t('auth.password'), autocomplete: 'current-password',
     });
+    var pwToggle = h(
+      'button',
+      {
+        class: 'pw-toggle', type: 'button', 'aria-label': t('auth.showPassword'),
+        onclick: function () {
+          var show = passInput.type === 'password';
+          passInput.type = show ? 'text' : 'password';
+          pwToggle.textContent = show ? '🙈' : '👁';
+          pwToggle.setAttribute('aria-label', show ? t('auth.hidePassword') : t('auth.showPassword'));
+          passInput.focus();
+        },
+      },
+      '👁'
+    );
+    var pwWrap = h('div', { class: 'pw-wrap' }, passInput, pwToggle);
+
     var errEl = h('div', { class: 'auth-error', style: 'display:none' });
+    if (opts.expired) {
+      errEl.textContent = t('auth.sessionExpired');
+      errEl.style.display = 'block';
+    }
+    function showError(msg) {
+      errEl.textContent = msg;
+      errEl.style.display = 'block';
+    }
+
+    var submitBtn = h(
+      'button',
+      { class: 'btn save auth-submit', type: 'button', onclick: function () { submit(); } },
+      t('auth.login')
+    );
+    var submitting = false;
+    function setLoading(b) {
+      submitting = b;
+      submitBtn.disabled = b;
+      userInput.disabled = b;
+      passInput.disabled = b;
+      submitBtn.classList.toggle('loading', b);
+      submitBtn.textContent = b ? t('auth.loggingIn') : t('auth.login');
+    }
 
     function submit() {
-      var res = window.Auth.login(userInput.value, passInput.value);
-      if (res.ok) {
-        enterApp(res.username).then(function () {
-          showToast(t('auth.welcome', { name: res.username }));
-        });
+      if (submitting) return;
+      var u = userInput.value;
+      var p = passInput.value;
+      if (!u.trim() || !p) {
+        showError(t('auth.errorEmpty'));
+        (!u.trim() ? userInput : passInput).classList.add('error');
         return;
       }
-      var key =
-        res.error === 'unknownUser' ? 'auth.errorUnknownUser'
-        : res.error === 'wrongPassword' ? 'auth.errorWrongPassword'
-        : 'auth.errorEmpty';
-      errEl.textContent = t(key);
-      errEl.style.display = 'block';
-      (res.error === 'wrongPassword' ? passInput : userInput).classList.add('error');
+      setLoading(true);
+      window.Auth.login(u, p).then(function (res) {
+        setLoading(false);
+        if (res.ok) {
+          enterApp().then(function () {
+            showToast(t('auth.welcome', { name: window.CurrentUser.displayName() }));
+          });
+          return;
+        }
+        if (res.error === 'locked') {
+          showError(t('auth.tooManyAttempts', { seconds: res.wait }));
+          return;
+        }
+        // Generic message — never reveals whether the username exists.
+        showError(t('auth.invalidCredentials'));
+        passInput.classList.add('error');
+      });
     }
 
     [userInput, passInput].forEach(function (inp) {
@@ -1973,50 +2359,200 @@
     var card = h(
       'div',
       { class: 'auth-card' },
-      h('div', { class: 'auth-top' }, langBtn),
       h('div', { class: 'auth-logo', text: '🧺' }),
       h('h1', { class: 'auth-title', text: t('auth.title') }),
       h('p', { class: 'auth-subtitle', text: t('auth.subtitle') }),
+      langSel,
       h('label', { class: 'field-label', text: t('auth.username') }),
       userInput,
       h('label', { class: 'field-label', text: t('auth.password') }),
-      passInput,
+      pwWrap,
       errEl,
-      h('button', { class: 'btn save auth-submit', type: 'button', onclick: submit }, t('auth.login')),
+      submitBtn,
       h('p', { class: 'auth-hint', text: t('auth.demoHint') })
     );
     root.appendChild(h('div', { class: 'auth-screen' }, card));
     setTimeout(function () { userInput.focus(); }, 50);
   }
 
-  // ---- Auth / boot ----
-  function enterApp(username) {
-    window.PantryDB.setUser(username);
-    window.I18N.setUser(username); // load this user's language preference
-    return load().then(function () {
-      recomputeShortfall();
-      renderMain();
+  // ---- User profile (avatar / display name / language / logout) ----
+  function openProfile() {
+    var cu = window.CurrentUser;
+    var overlay = h('div', { class: 'overlay center' });
+    function close() { overlay.remove(); }
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+
+    var av = { image: cu.avatar() };
+    var avatarBox = h('div', { class: 'profile-avatar' });
+    var fileInput = h('input', { class: 'photo-file', type: 'file', accept: 'image/*' });
+    function renderAvatar() {
+      avatarBox.innerHTML = '';
+      var tile = av.image
+        ? h('div', { class: 'avatar lg has-img' }, h('img', { class: 'avatar-img', src: av.image, alt: '' }))
+        : h('div', { class: 'avatar lg', text: cu.initials() });
+      var addBtn = h('button', { class: 'btn ghost', type: 'button', onclick: function () { fileInput.click(); } },
+        av.image ? t('auth.changeAvatar') : t('auth.addAvatar'));
+      var rm = av.image
+        ? h('button', { class: 'btn ghost danger', type: 'button', onclick: function () { av.image = null; renderAvatar(); } }, t('auth.removeAvatar'))
+        : null;
+      avatarBox.appendChild(tile);
+      avatarBox.appendChild(h('div', { class: 'photo-actions', style: 'justify-content:center' }, addBtn, rm));
+    }
+    fileInput.addEventListener('change', function () {
+      var f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      processImage(f, function (pair) {
+        // Avatars are small — store the compact thumb variant (WebP if supported).
+        if (pair) { av.image = pair.thumb || pair.full; renderAvatar(); }
+        else showToast(t('form.imageError'));
+        fileInput.value = '';
+      });
     });
+    renderAvatar();
+
+    var nameInput = h('input', { class: 'input', type: 'text', value: cu.displayName() || '', 'aria-label': t('auth.displayName') });
+
+    // Language segmented control (per-user).
+    var langSel = h('div', { class: 'segment' });
+    [['en', 'English'], ['he', 'עברית']].forEach(function (pair) {
+      langSel.appendChild(
+        h('button', {
+          class: 'segment-item' + (window.I18N.getLang() === pair[0] ? ' active' : ''),
+          type: 'button',
+          onclick: function () {
+            if (window.I18N.getLang() !== pair[0]) {
+              window.I18N.setLang(pair[0]);
+              window.Auth.updateProfile({ lang: pair[0] });
+              renderMain();
+              close();
+              openProfile();
+            }
+          },
+        }, pair[1])
+      );
+    });
+
+    function save() {
+      var patch = { avatar: av.image, displayName: nameInput.value.trim() || cu.username() };
+      window.Auth.updateProfile(patch);
+      renderMain();
+      close();
+    }
+
+    var dialog = h(
+      'div',
+      { class: 'dialog profile-dialog' },
+      h('div', { class: 'sheet-header' },
+        h('h2', { class: 'dialog-title', text: t('auth.profile') }),
+        h('button', { class: 'sheet-close', 'aria-label': 'X', onclick: close }, '✕')
+      ),
+      avatarBox,
+      fileInput,
+      h('label', { class: 'field-label', text: t('auth.displayName') }),
+      nameInput,
+      h('label', { class: 'field-label', text: t('auth.username') }),
+      h('div', { class: 'profile-username', text: '@' + cu.username() }),
+      h('label', { class: 'field-label', text: t('auth.preferredLanguage') }),
+      langSel,
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn cancel', type: 'button', onclick: function () { confirmLogout(); } }, t('auth.logout')),
+        h('button', { class: 'btn save', type: 'button', onclick: save }, t('auth.save'))
+      )
+    );
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    setTimeout(function () { nameInput.focus(); }, 50);
+  }
+
+  function confirmLogout() {
+    var overlay = h('div', { class: 'overlay center' });
+    function close() { overlay.remove(); }
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+    var dialog = h(
+      'div',
+      { class: 'dialog' },
+      h('h2', { class: 'dialog-title', text: t('auth.confirmLogoutTitle') }),
+      h('p', { class: 'dialog-msg', text: t('auth.confirmLogoutMsg') }),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn cancel', type: 'button', onclick: close }, t('form.cancel')),
+        h('button', { class: 'btn danger', type: 'button', onclick: function () { close(); doLogout(); } }, t('auth.logout'))
+      )
+    );
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+  }
+
+  // ---- Auth / boot ----
+  function enterApp() {
+    var uid = window.CurrentUser.id();
+    window.PantryDB.setUser(uid); // scope all data access to this user id
+    window.I18N.setUser(uid); // load this user's language preference
+    window.Auth.touchSession();
+    return load()
+      .then(function () {
+        // One-time: fold any legacy inline images into the deduped image store.
+        return migrateInlineImages();
+      })
+      .then(function () {
+        recomputeShortfall();
+        renderMain();
+      });
   }
 
   function doLogout() {
     window.Auth.logout();
-    window.PantryDB.setUser(null);
-    window.I18N.setUser(null);
+    window.PantryDB.setUser(null); // drop data scope
+    window.I18N.setUser(null); // back to shared login-screen language
     items = [];
     renderLogin();
     showToast(t('auth.loggedOut'));
   }
 
-  function start() {
-    window.Auth.init(); // seed demo users (aviraz/aviraz, guest/guest)
-    window.I18N.init(); // shared language for the login screen
-    // One-time migration of any pre-auth data into the seeded 'aviraz' user.
-    window.PantryDB.migrateLegacyInto('aviraz').then(function () {
-      var user = window.Auth.currentUser();
-      if (user) enterApp(user);
-      else renderLogin();
+  // Seed the optional second demo user's inventory with distinct sample data so
+  // per-user isolation is visibly demonstrable. Runs once (flag-guarded).
+  function seedTestUserData() {
+    var FLAG = 'pantry.seed.test.v1';
+    try {
+      if (localStorage.getItem(FLAG)) return Promise.resolve();
+    } catch (e) {}
+    if (!window.Auth.getUser('test')) return Promise.resolve();
+    window.PantryDB.setUser('test');
+    return window.PantryDB.getAll().then(function (existing) {
+      var chain = Promise.resolve();
+      if (!existing || !existing.length) {
+        [
+          { name: 'Coffee', quantity: 1, unit: 'g', categoryId: 'drinks', location: 'Pantry', emoji: '☕', desiredAmount: 2 },
+          { name: 'Pasta', quantity: 3, unit: 'pack', categoryId: 'dry', location: 'Pantry', emoji: '🍝', desiredAmount: 4 },
+          { name: 'Bananas', quantity: 0, unit: 'kg', categoryId: 'fruit', location: 'Pantry', emoji: '🍌', desiredAmount: 1 },
+          { name: 'Orange juice', quantity: 1, unit: 'L', categoryId: 'drinks', location: 'Fridge', emoji: '🧃' },
+        ].forEach(function (s) {
+          chain = chain.then(function () { return window.PantryDB.create(s); });
+        });
+      }
+      return chain.then(function () {
+        try { localStorage.setItem(FLAG, '1'); } catch (e) {}
+        window.PantryDB.setUser(null);
+      });
     });
+  }
+
+  function start() {
+    window.I18N.init(); // shared language for the login screen
+    window.Auth.init() // seed demo users (async: salted hashing)
+      .then(function () { return seedTestUserData(); })
+      .then(function () {
+        // One-time migration of any pre-auth data into the seeded 'aviraz' user.
+        return window.PantryDB.migrateLegacyInto('aviraz');
+      })
+      .then(function () {
+        var st = window.Auth.restore(); // 'ok' | 'expired' | 'none'
+        if (st === 'ok') enterApp();
+        else if (st === 'expired') renderLogin({ expired: true });
+        else renderLogin();
+      })
+      .catch(function () {
+        renderLogin();
+      });
   }
 
   window.App = { start: start, renderMain: renderMain };
