@@ -430,6 +430,39 @@
     } catch (e) {}
   }
 
+  // ---- Delete ALL of a user's data (used by optional profile deletion) ----
+  // Removes the per-user IndexedDB database and every per-user localStorage
+  // key (inventory/barcodes/images fallbacks, monthly log, language, flags).
+  // Never touches other users' namespaces. Resolves when done.
+  function deleteUserData(userId) {
+    if (!userId) return Promise.resolve();
+    try {
+      [
+        'pantry.items.fallback.' + userId,
+        'pantry.barcodes.fallback.' + userId,
+        'pantry.images.fallback.' + userId,
+        'pantry.monthly.v1.' + userId,
+        'pantry.lang.' + userId,
+        'pantry.imgmig.v1.' + userId,
+      ].forEach(function (k) {
+        localStorage.removeItem(k);
+      });
+    } catch (e) {}
+    if (!useIDB) return Promise.resolve();
+    return new Promise(function (resolve) {
+      try {
+        var name = BASE + '-u-' + userId;
+        if (DB_NAME === name) dbPromise = null; // drop any cached connection
+        var req = indexedDB.deleteDatabase(name);
+        req.onsuccess = function () { resolve(); };
+        req.onerror = function () { resolve(); };
+        req.onblocked = function () { resolve(); };
+      } catch (e) {
+        resolve();
+      }
+    });
+  }
+
   // ---- Migration registry (versioned + checkpointed) ----
   // Records which migrations have completed so they run exactly once and are
   // safe across interrupted/partial runs. Stored as:
@@ -530,6 +563,7 @@
     deleteImage: deleteImage,
     getMonthlyLog: getMonthlyLog,
     setMonthlyLog: setMonthlyLog,
+    deleteUserData: deleteUserData,
     migrateLegacyInto: migrateLegacyInto,
     hasMigration: hasMigration,
     getMigrations: getMigrations,

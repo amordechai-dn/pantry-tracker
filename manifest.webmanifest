@@ -1,32 +1,27 @@
 {
-  "name": "Pantry Tracker",
-  "short_name": "Pantry",
-  "description": "Track the food and groceries you have at home — offline, on your phone.",
+  "name": "HomeStock — Smart Home Inventory",
+  "short_name": "HomeStock",
+  "description": "Smart home inventory — track what you have at home, grouped by where you store it. Offline, on your phone.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#EEF4FB",
-  "theme_color": "#1877D1",
+  "background_color": "#FFFFFF",
+  "theme_color": "#34A853",
   "lang": "en",
   "dir": "auto",
   "icons": [
-    {
-      "src": "./icons/icon-192.png",
-      "sizes": "192x192",
-      "type": "image/png",
-      "purpose": "any maskable"
-    },
-    {
-      "src": "./icons/icon-512.png",
-      "sizes": "512x512",
-      "type": "image/png",
-      "purpose": "any maskable"
-    },
-    {
-      "src": "./icons/apple-touch-icon-180.png",
-      "sizes": "180x180",
-      "type": "image/png"
-    }
+    { "src": "./icons/icon-16.png", "sizes": "16x16", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-32.png", "sizes": "32x32", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-48.png", "sizes": "48x48", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-72.png", "sizes": "72x72", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-96.png", "sizes": "96x96", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-128.png", "sizes": "128x128", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-256.png", "sizes": "256x256", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-384.png", "sizes": "384x384", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "./icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ]
 }

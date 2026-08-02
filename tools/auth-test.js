@@ -1,11 +1,11 @@
-/* Automated logic harness for the multi-user auth + per-user storage system.
-   Runs on Node using the localStorage-fallback path of db.js and the real
-   Web Crypto API (globalThis.crypto) used by auth.js. No browser required.
+/* Automated logic harness for the passwordless open-profile system + per-user
+   storage. Runs on Node using the localStorage-fallback path of db.js. No
+   browser required.
 
    Run: node tools/auth-test.js   (exit code 0 = all pass)
 
-   NOTE: This exercises logic only. Camera, RTL visuals, and real IndexedDB are
-   covered by the manual verification checklist in the report. */
+   NOTE: This exercises logic only. Camera, RTL visuals, real IndexedDB and the
+   canvas image pipeline are covered by manual verification. */
 'use strict';
 
 // ---- Minimal browser-ish stubs ----
@@ -30,6 +30,29 @@ global.localStorage = {
   removeItem: function (k) { delete _store[k]; },
 };
 global.window = {};
+
+// ---- Seed an OLD password-format profile store (v2, WITH credentials) so we
+//      can verify the one-time passwordless migration strips them safely. ----
+_store['pantry.auth.users.v2'] = JSON.stringify({
+  users: {
+    aviraz: {
+      id: 'aviraz', username: 'aviraz', usernameLower: 'aviraz', displayName: 'Aviraz',
+      avatar: null, lang: null,
+      cred: { algo: 'PBKDF2-SHA256', iterations: 150000, salt: 'a'.repeat(32), hash: 'b'.repeat(64) },
+      createdAt: '2020-01-01T00:00:00.000Z', updatedAt: '2020-01-01T00:00:00.000Z',
+    },
+    test: {
+      id: 'test', username: 'test', usernameLower: 'test', displayName: 'Test User',
+      avatar: null, lang: null,
+      cred: { algo: 'weak-fallback', iterations: 1, salt: 'cccc', hash: 'dddd' },
+      createdAt: '2020-01-02T00:00:00.000Z', updatedAt: '2020-01-02T00:00:00.000Z',
+    },
+  },
+  byUsername: { aviraz: 'aviraz', test: 'test' },
+});
+// Obsolete password-era session + rate-limit state (should be cleaned up).
+_store['pantry.auth.session.v2'] = JSON.stringify({ userId: 'aviraz', expiresAt: Date.now() + 1e9 });
+_store['pantry.auth.attempts.v1'] = JSON.stringify({ aviraz: { count: 3, first: Date.now() } });
 
 // ---- Seed pre-auth (v1.3.0-style) legacy data BEFORE loading modules ----
 _store['pantry.items.fallback'] = JSON.stringify([
@@ -60,144 +83,112 @@ async function rejects(name, fn) {
 }
 
 (async function run() {
-  console.log('AUTH + PER-USER STORAGE HARNESS');
+  console.log('PASSWORDLESS PROFILES + PER-USER STORAGE HARNESS');
 
-  // 1) Demo-user init + salted hashing, no plaintext
-  console.log('\n[init & hashing]');
-  await Auth.init();
-  ok('crypto (Web Crypto/PBKDF2) available', Auth._internals.cryptoAvailable === true);
-  var users = Auth.listUsers().map(function (u) { return u.username; }).sort();
-  ok('seeds aviraz + test', users.join(',') === 'aviraz,test');
-  ok('aviraz has stable id "aviraz"', !!Auth.getUser('aviraz') && Auth.getUser('aviraz').id === 'aviraz');
-  ok('display name Aviraz', Auth.getUser('aviraz').displayName === 'Aviraz');
-  var rawUsers = JSON.parse(_store['pantry.auth.users.v2']);
-  var avizCred = rawUsers.users['aviraz'].cred;
-  ok('stores salted PBKDF2 hash (algo)', avizCred.algo === 'PBKDF2-SHA256');
-  ok('has per-user salt', typeof avizCred.salt === 'string' && avizCred.salt.length >= 16);
-  ok('has derived hash', typeof avizCred.hash === 'string' && avizCred.hash.length >= 32);
-  ok('no plaintext "password" field stored', JSON.stringify(rawUsers).indexOf('"password"') === -1);
-  ok('sanitized user exposes no cred', !('cred' in Auth.getUser('aviraz')));
+  // 1) Migration: password profiles -> open profiles (once, idempotent, safe)
+  console.log('\n[migration to passwordless]');
+  await Auth.init(); // runs UserMigration + seeds demo profiles
+  var repo = Auth._internals.UserRepository;
+  ok('aviraz credential removed', !('cred' in (repo.getById('aviraz') || {})));
+  ok('test credential removed', !('cred' in (repo.getById('test') || {})));
+  ok('no "cred" anywhere in store', (_store['pantry.auth.users.v2'] || '').indexOf('"cred"') === -1);
+  ok('no PBKDF2/hash residue in store', (_store['pantry.auth.users.v2'] || '').indexOf('PBKDF2') === -1);
+  ok('old session cleared', localStorage.getItem('pantry.auth.session.v2') === null);
+  ok('old attempts cleared', localStorage.getItem('pantry.auth.attempts.v1') === null);
+  ok('migration checkpoint recorded', Auth._internals.UserMigration.done() === true);
+  ok('migration is idempotent (no-op on re-run)', Auth._internals.UserMigration.run() === false);
 
-  // 2) Duplicate-seed prevention
-  console.log('\n[idempotent seeding]');
-  await Auth.init();
-  ok('re-init does not duplicate users', Auth.listUsers().length === 2);
+  // 2) Preserved + seeded profiles
+  console.log('\n[profiles preserved + seeded]');
+  var names = Auth.listUsers().map(function (u) { return u.id; }).sort();
+  ok('Aviraz + Guest + Test all present', names.join(',') === 'aviraz,guest,test');
+  ok('aviraz has stable id "aviraz"', Auth.getUser('aviraz').id === 'aviraz');
+  ok('aviraz keeps display name', Auth.getUser('aviraz').displayName === 'Aviraz');
+  ok('guest profile seeded', !!Auth.getUser('guest'));
+  ok('sanitized profile exposes no cred', !('cred' in Auth.getUser('aviraz')));
+  ok('re-init does not duplicate profiles', (await Auth.init(), Auth.listUsers().length === 3));
 
-  // 3) Password hashing + verification (unit)
-  console.log('\n[password hash/verify]');
-  var cred = await Auth._internals.CryptoHasher.hash('correct horse');
-  ok('verify correct password', (await Auth._internals.CryptoHasher.verify('correct horse', cred)) === true);
-  ok('reject wrong password', (await Auth._internals.CryptoHasher.verify('wrong', cred)) === false);
-  ok('unique salts per hash', cred.salt !== (await Auth._internals.CryptoHasher.hash('correct horse')).salt);
-
-  // 4) Login success / failure (generic error)
-  console.log('\n[login]');
-  var good = await Auth.login('aviraz', 'aviraz');
-  ok('login ok (aviraz/aviraz)', good.ok === true && good.user.id === 'aviraz');
-  ok('CurrentUser set after login', CurrentUser.id() === 'aviraz');
-  ok('isAuthenticated true', Auth.isAuthenticated() === true);
-  Auth.logout();
-  var badPw = await Auth.login('aviraz', 'nope');
-  ok('wrong password -> generic invalid', badPw.ok === false && badPw.error === 'invalid');
-  var badUser = await Auth.login('ghost', 'whatever');
-  ok('unknown user -> same generic invalid', badUser.ok === false && badUser.error === 'invalid');
-  var empty = await Auth.login('aviraz', '');
-  ok('empty -> empty error', empty.ok === false && empty.error === 'empty');
-
-  // 5) Rate limiting / throttling
-  console.log('\n[rate limiting]');
-  Auth._internals.RateLimiter.clear('aviraz');
-  var locked = null;
-  for (var i = 0; i < 6; i++) locked = await Auth.login('aviraz', 'bad' + i);
-  ok('locks after repeated failures', locked.error === 'locked' && typeof locked.wait === 'number');
-  ok('correct password still blocked while locked', (await Auth.login('aviraz', 'aviraz')).error === 'locked');
-  Auth._internals.RateLimiter.clear('aviraz');
-  ok('unlocks after clear (window reset)', (await Auth.login('aviraz', 'aviraz')).ok === true);
-
-  // 6) Offline login (no network dependency)
-  console.log('\n[offline login]');
-  Auth.logout();
-  global.navigator.onLine = false;
-  var offline = await Auth.login('aviraz', 'aviraz');
-  ok('login works offline', offline.ok === true);
-  global.navigator.onLine = true;
-
-  // 7) Session restore / refresh / logout / expiry
-  console.log('\n[session]');
-  ok('restore after "refresh" -> ok', Auth.restore() === 'ok' && CurrentUser.id() === 'aviraz');
-  Auth.logout();
-  ok('logout clears session', Auth.restore() === 'none' && CurrentUser.get() === null);
-  ok('unauthorized route (no current user)', Auth.isAuthenticated() === false);
-  // craft an expired session
-  await Auth.login('aviraz', 'aviraz');
-  var sess = JSON.parse(_store['pantry.auth.session.v2']);
-  sess.expiresAt = Date.now() - 1000;
-  _store['pantry.auth.session.v2'] = JSON.stringify(sess);
-  Auth.logout(); // clear in-memory current so restore is the source of truth
-  _store['pantry.auth.session.v2'] = JSON.stringify(sess); // logout removed it; re-set expired
-  ok('expired session -> expired', Auth.restore() === 'expired');
-
-  // 8) Migration of legacy data into aviraz (idempotent, id-preserving)
-  console.log('\n[migration]');
+  // 3) Selecting a profile loads the correct (migrated) data
+  console.log('\n[select profile -> data]');
   var migrated = await DB.migrateLegacyInto('aviraz');
-  ok('migration runs once (returns true)', migrated === true);
-  ok('migration checkpoint recorded', DB.hasMigration('legacy-into-user-v1') === true);
-  DB.setUser('aviraz');
+  ok('legacy migration runs once (true)', migrated === true);
+  var sel = Auth.selectUser('aviraz');
+  ok('selectUser returns the user (no password)', !!sel && sel.id === 'aviraz');
+  ok('active user is aviraz', CurrentUser.id() === 'aviraz');
+  DB.setUser(CurrentUser.id());
   var avInv = await DB.getAll();
-  ok('legacy items migrated into aviraz (2)', avInv.length === 2);
+  ok('selecting aviraz loads its data (2 legacy items)', avInv.length === 2);
   ok('preserves original ids', avInv.some(function (x) { return x.id === 'legacy1'; }));
-  ok('per-user monthly log copied', !!_store['pantry.monthly.v1.aviraz']);
-  ok('per-user language copied (he)', _store['pantry.lang.aviraz'] === 'he');
-  var again = await DB.migrateLegacyInto('aviraz');
-  ok('re-migration is a no-op (false)', again === false);
-  DB.setUser('aviraz');
-  ok('no duplicate items after re-run', (await DB.getAll()).length === 2);
+  ok('per-user language preserved (he)', _store['pantry.lang.aviraz'] === 'he');
 
-  // 9) User data isolation
-  console.log('\n[data isolation]');
-  DB.setUser('test');
-  await DB.create({ name: 'Test Coffee', quantity: 1, unit: 'g', categoryId: 'drinks', location: 'Pantry' });
-  var testInv = await DB.getAll();
-  ok('test user has its own inventory', testInv.some(function (x) { return x.name === 'Test Coffee'; }));
-  DB.setUser('aviraz');
-  var avInv2 = await DB.getAll();
-  ok('aviraz cannot see test data', !avInv2.some(function (x) { return x.name === 'Test Coffee'; }));
-  ok('aviraz inventory unchanged (2)', avInv2.length === 2);
+  // 4) Refresh restores the active user
+  console.log('\n[restore active user]');
+  CurrentUser._clear(); // simulate a page reload (in-memory context lost)
+  ok('restore -> ok', Auth.restore() === 'ok');
+  ok('restored active user is aviraz', CurrentUser.id() === 'aviraz');
 
-  // 10) Barcode mappings scoped per user
-  console.log('\n[barcode scoping]');
-  DB.setUser('test');
-  await DB.putBarcode({ barcode: '999', name: 'Test-only', categoryId: 'dry', unit: 'pack' });
-  ok('test can read its own barcode', (await DB.getBarcode('999')) !== null);
-  DB.setUser('aviraz');
-  ok('aviraz cannot read test barcode', (await DB.getBarcode('999')) === null);
+  // 5) Create user (display name required; username dedupe)
+  console.log('\n[create user]');
+  var created = await Auth.createUser({ displayName: 'Dana', username: 'dana', lang: 'en' });
+  ok('create user succeeds', created.ok === true && !!created.user.id);
+  var danaId = created.user.id;
+  ok('new user appears in list', Auth.listUsers().some(function (u) { return u.id === danaId; }));
+  var dup = await Auth.createUser({ displayName: 'Dana II', username: 'dana' });
+  ok('duplicate username prevented', dup.ok === false && dup.error === 'exists');
+  var empty = await Auth.createUser({ displayName: '   ' });
+  ok('display name required', empty.ok === false && empty.error === 'empty');
 
-  // 11) Repository-level scope enforcement
+  // 6) New-user isolation + switching changes the active data scope
+  console.log('\n[isolation + switching]');
+  Auth.selectUser(danaId); DB.setUser(CurrentUser.id());
+  ok('new user starts empty', (await DB.getAll()).length === 0);
+  await DB.create({ name: 'Dana Milk', quantity: 1, unit: 'L', categoryId: 'dairy', location: 'Fridge' });
+  ok('dana now has 1 item', (await DB.getAll()).length === 1);
+  Auth.selectUser('aviraz'); DB.setUser(CurrentUser.id());
+  ok('switching back to aviraz shows its 2 items', (await DB.getAll()).length === 2);
+  ok('aviraz cannot see dana data', !(await DB.getAll()).some(function (x) { return x.name === 'Dana Milk'; }));
+
+  // 7) Scope enforcement at the data layer (no active user)
   console.log('\n[scope enforcement]');
   DB.setUser(null);
   await rejects('getAll rejects with no user scope', function () { return DB.getAll(); });
   await rejects('create rejects with no user scope', function () { return DB.create({ name: 'x' }); });
-  await rejects('getBarcode rejects with no user scope', function () { return DB.getBarcode('1'); });
 
-  // 12) Switching between two users
-  console.log('\n[user switching]');
-  var t = await Auth.login('test', 'test');
-  ok('login test', t.ok && CurrentUser.id() === 'test');
-  DB.setUser(CurrentUser.id());
-  ok('scoped inventory = test', (await DB.getAll()).some(function (x) { return x.name === 'Test Coffee'; }));
-  var a = await Auth.login('aviraz', 'aviraz');
-  ok('switch to aviraz', a.ok && CurrentUser.id() === 'aviraz');
-  DB.setUser(CurrentUser.id());
-  ok('scoped inventory = aviraz', (await DB.getAll()).some(function (x) { return x.id === 'legacy1'; }));
+  // 8) Delete user (guarded) + data removal
+  console.log('\n[delete user]');
+  Auth.selectUser('aviraz'); // aviraz active
+  ok('cannot delete the ACTIVE profile', Auth.deleteUser('aviraz') === false);
+  var delOk = Auth.deleteUser(danaId);
+  await DB.deleteUserData(danaId);
+  ok('delete removes the profile record', delOk === true && !Auth.listUsers().some(function (u) { return u.id === danaId; }));
+  DB.setUser(danaId);
+  ok("deleted user's data is cleared", (await DB.getAll()).length === 0);
 
-  // 13) i18n keys present in EN + HE
+  // 9) Logout returns to the picker (clears active only, no data loss)
+  console.log('\n[logout -> picker]');
+  Auth.selectUser('aviraz'); DB.setUser('aviraz');
+  Auth.logout();
+  ok('logout clears the active selection', Auth.isAuthenticated() === false);
+  ok('restore after logout -> none', Auth.restore() === 'none');
+  DB.setUser('aviraz');
+  ok('aviraz data still intact after logout (2)', (await DB.getAll()).length === 2);
+
+  // 10) i18n keys present in EN + HE (new passwordless strings)
   console.log('\n[i18n]');
-  ['auth.invalidCredentials', 'auth.tooManyAttempts', 'auth.showPassword', 'auth.profile',
-   'auth.displayName', 'auth.sessionExpired', 'auth.confirmLogoutMsg', 'auth.loggingIn'].forEach(function (k) {
-    I18N.setLang('en'); var en = I18N.t(k, { seconds: 9 });
-    I18N.setLang('he'); var he = I18N.t(k, { seconds: 9 });
+  ['auth.chooseUser', 'auth.addUser', 'auth.createUser', 'auth.switchUser', 'auth.editUser',
+   'auth.deleteUser', 'auth.save', 'auth.displayName', 'auth.preferredLanguage', 'auth.userCreated',
+   'auth.userDeleted', 'auth.confirmDeleteTitle', 'auth.confirmDeleteMsg', 'auth.chooseAnother',
+   'auth.activeUser', 'form.cancel', 'app.tagline'].forEach(function (k) {
+    I18N.setLang('en'); var en = I18N.t(k, { name: 'X' });
+    I18N.setLang('he'); var he = I18N.t(k, { name: 'X' });
     ok(k + ' (en+he present, non-key)', en !== k && he !== k && en !== he);
   });
+
+  // 11) No password logic remains on the public API
+  console.log('\n[no password logic]');
+  ok('Auth.login removed', typeof Auth.login === 'undefined');
+  ok('no rate limiter exposed', !Auth._internals.RateLimiter);
+  ok('no crypto hasher exposed', !Auth._internals.CryptoHasher);
 
   console.log('\n============================');
   console.log('PASS ' + pass + '  FAIL ' + fail);

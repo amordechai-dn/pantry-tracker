@@ -1,118 +1,35 @@
 /* ============================================================================
-   Authentication layer — modular, swappable, LOCAL-DEMO ONLY.
+   User layer — open passwordless household profiles (LOCAL, no server).
 
-   ⚠️ SECURITY NOTE: This is a *local demo* auth system. It runs entirely in the
-   browser with no server. Passwords are never stored in plaintext — they are
-   salted and hashed with PBKDF2 (SHA-256, many iterations) via the Web Crypto
-   API — but this is NOT production-secure: anyone with access to the device /
-   browser storage can read all local data, and there is no server-side trust.
-   Do not use for real credentials. It exists to gate the UI and namespace
-   per-user data, and is intentionally structured so the demo pieces can be
-   swapped for a real provider (Firebase/Supabase/OAuth/custom) without touching
-   inventory / shopping / barcode / monthly logic.
+   HomeStock is a shared home-inventory app: profiles are NOT secure accounts,
+   they simply pick "who is using the app" so each person's inventory, lists,
+   monthly plans, barcode mappings, products, images and settings stay isolated
+   by a stable userId. There are NO passwords, NO hashing, NO login attempts —
+   tapping a profile enters immediately.
 
-   Abstractions (all behind stable interfaces):
-     - CryptoHasher    : PBKDF2 salted hashing + verification (Web Crypto)
-     - UserRepository  : CRUD for user records (localStorage-backed)
-     - SessionManager  : create/restore/expire local sessions (sliding renewal)
-     - RateLimiter     : throttle rapid repeated login attempts
-     - CurrentUser     : read-only accessor for the authenticated user (context)
-     - AuthService     : orchestrates the above (window.Auth)
+   Modular pieces (behind stable interfaces so a real backend could be added):
+     - UserRepository    : CRUD for profile records (localStorage-backed)
+     - ActiveUserManager : persist / restore the selected (active) profile
+     - UserContext       : read-only accessor for the active user (window.CurrentUser)
+     - UserMigration     : one-time, idempotent, interrupt-safe upgrade from the
+                           old password-based records (strips credentials)
+     - UserService       : orchestrates the above (window.Auth)
 
-   The rest of the app depends ONLY on window.Auth (AuthService) and
-   window.CurrentUser — never on the demo storage details.
+   The rest of the app depends only on window.Auth + window.CurrentUser and on
+   the active userId — never on storage details.
    ============================================================================ */
 (function () {
   'use strict';
 
-  // ---- Web Crypto handles (browser: crypto.*, Node harness: globalThis.crypto) ----
-  var _crypto =
-    typeof crypto !== 'undefined' && crypto.subtle
-      ? crypto
-      : typeof globalThis !== 'undefined' && globalThis.crypto && globalThis.crypto.subtle
-      ? globalThis.crypto
-      : typeof crypto !== 'undefined'
-      ? crypto
-      : null;
-  var subtle = _crypto && _crypto.subtle ? _crypto.subtle : null;
-
-  function randomBytes(n) {
-    var a = new Uint8Array(n);
-    if (_crypto && _crypto.getRandomValues) _crypto.getRandomValues(a);
-    else for (var i = 0; i < n; i++) a[i] = Math.floor(Math.random() * 256); // last resort
-    return a;
-  }
-  function toHex(bytes) {
-    var s = '';
-    for (var i = 0; i < bytes.length; i++) {
-      var h = bytes[i].toString(16);
-      s += h.length < 2 ? '0' + h : h;
-    }
-    return s;
-  }
-  function fromHex(hex) {
-    var a = new Uint8Array(hex.length / 2);
-    for (var i = 0; i < a.length; i++) a[i] = parseInt(hex.substr(i * 2, 2), 16);
-    return a;
-  }
-  // Length-safe comparison of two hex digests (avoids trivial early-exit).
-  function safeEqual(a, b) {
-    if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length)
-      return false;
-    var r = 0;
-    for (var i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
-    return r === 0;
-  }
-  // Non-crypto fallback ONLY if Web Crypto is unavailable (marked in cred.algo).
-  function weakHex(s) {
-    var h = 5381;
-    for (var i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
-    return ('00000000' + h.toString(16)).slice(-8);
+  function newId() {
+    return 'u_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   }
 
-  // ---- CryptoHasher ----
-  var PBKDF2_ITERS = 150000;
-  var CryptoHasher = {
-    algo: subtle ? 'PBKDF2-SHA256' : 'weak-fallback',
-    deriveHex: function (password, saltBytes, iters) {
-      if (subtle) {
-        var enc = new TextEncoder();
-        return subtle
-          .importKey('raw', enc.encode(String(password)), { name: 'PBKDF2' }, false, ['deriveBits'])
-          .then(function (km) {
-            return subtle.deriveBits(
-              { name: 'PBKDF2', salt: saltBytes, iterations: iters, hash: 'SHA-256' },
-              km,
-              256
-            );
-          })
-          .then(function (bits) {
-            return toHex(new Uint8Array(bits));
-          });
-      }
-      return Promise.resolve(weakHex(String(password) + toHex(saltBytes)));
-    },
-    // Returns a credential object { algo, iterations, salt, hash }. No plaintext.
-    hash: function (password) {
-      var salt = randomBytes(16);
-      var iters = subtle ? PBKDF2_ITERS : 1;
-      var self = this;
-      return this.deriveHex(password, salt, iters).then(function (hex) {
-        return { algo: self.algo, iterations: iters, salt: toHex(salt), hash: hex };
-      });
-    },
-    verify: function (password, cred) {
-      if (!cred || !cred.salt || !cred.hash) return Promise.resolve(false);
-      return this.deriveHex(password, fromHex(cred.salt), cred.iterations || 1).then(function (hex) {
-        return safeEqual(hex, cred.hash);
-      });
-    },
-  };
-
-  // ---- UserRepository (localStorage-backed; swap this for a real backend) ----
-  // Shape: { users: { <id>: rec }, byUsername: { <lower>: <id> } }
+  // ---- UserRepository (localStorage-backed; swap for a real backend later) ----
+  // Records are stored under the same key as before so existing profiles (and
+  // their stable ids → per-user data) are preserved across the upgrade.
   //   rec = { id, username, usernameLower, displayName, avatar, lang,
-  //           cred: { algo, iterations, salt, hash }, createdAt, updatedAt }
+  //           createdAt, updatedAt }   (NO credentials)
   var USERS_KEY = 'pantry.auth.users.v2';
   var UserRepository = {
     _load: function () {
@@ -131,45 +48,46 @@
       return this._load().users[id] || null;
     },
     getByUsername: function (username) {
+      var u = String(username || '').trim().toLowerCase();
+      if (!u) return null;
       var d = this._load();
-      var id = d.byUsername[String(username || '').trim().toLowerCase()];
+      var id = d.byUsername[u];
       return id ? d.users[id] || null : null;
     },
     all: function () {
       var d = this._load();
-      return Object.keys(d.users).map(function (k) {
-        return d.users[k];
-      });
+      return Object.keys(d.users)
+        .map(function (k) {
+          return d.users[k];
+        })
+        .sort(function (a, b) {
+          return (a.createdAt || '').localeCompare(b.createdAt || '');
+        });
     },
     exists: function (username) {
       return !!this.getByUsername(username);
     },
-    // Create a user (hashes the password, discards plaintext). Async.
+    // Create an open profile (no password). Returns the record.
     create: function (opts) {
-      var self = this;
+      var d = this._load();
       var username = String(opts.username || '').trim();
-      var id = opts.id || 'u_' + toHex(randomBytes(8));
-      return CryptoHasher.hash(opts.password).then(function (cred) {
-        var d = self._load();
-        var now = new Date().toISOString();
-        d.users[id] = {
-          id: id,
-          username: username,
-          usernameLower: username.toLowerCase(),
-          displayName: opts.displayName || username,
-          avatar: opts.avatar || null,
-          lang: opts.lang || null,
-          cred: cred,
-          createdAt: now,
-          updatedAt: now,
-        };
-        d.byUsername[username.toLowerCase()] = id;
-        self._save(d);
-        // opts.password intentionally goes out of scope here (not retained).
-        return d.users[id];
-      });
+      var id = opts.id || newId();
+      var now = new Date().toISOString();
+      d.users[id] = {
+        id: id,
+        username: username,
+        usernameLower: username.toLowerCase(),
+        displayName: String(opts.displayName || username || '').trim(),
+        avatar: opts.avatar || null,
+        lang: opts.lang || null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      if (username) d.byUsername[username.toLowerCase()] = id;
+      this._save(d);
+      return d.users[id];
     },
-    // Update non-credential profile fields.
+    // Update profile fields (never any credential — there are none).
     update: function (id, patch) {
       var d = this._load();
       var rec = d.users[id];
@@ -181,113 +99,59 @@
       this._save(d);
       return rec;
     },
+    remove: function (id) {
+      var d = this._load();
+      var rec = d.users[id];
+      if (!rec) return false;
+      delete d.users[id];
+      if (rec.usernameLower) delete d.byUsername[rec.usernameLower];
+      this._save(d);
+      return true;
+    },
   };
 
-  // Strip credentials before exposing a user anywhere in the app.
+  // Expose a profile (identical shape everywhere in the app).
   function sanitize(rec) {
     if (!rec) return null;
     return {
       id: rec.id,
-      username: rec.username,
-      displayName: rec.displayName || rec.username,
+      username: rec.username || '',
+      displayName: rec.displayName || rec.username || '',
       avatar: rec.avatar || null,
       lang: rec.lang || null,
     };
   }
 
-  // ---- SessionManager (local session with expiry + sliding renewal) ----
-  var SESSION_KEY = 'pantry.auth.session.v2';
-  var TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-  var SessionManager = {
-    _read: function () {
+  // ---- ActiveUserManager (which profile is currently selected) ----
+  var ACTIVE_KEY = 'pantry.auth.active.v1';
+  var ActiveUserManager = {
+    get: function () {
       try {
-        return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+        var s = JSON.parse(localStorage.getItem(ACTIVE_KEY) || 'null');
+        return s && s.userId ? s.userId : null;
       } catch (e) {
         return null;
       }
     },
-    _write: function (s) {
+    set: function (userId) {
       try {
-        localStorage.setItem(SESSION_KEY, JSON.stringify(s));
+        localStorage.setItem(ACTIVE_KEY, JSON.stringify({ userId: userId, at: Date.now() }));
       } catch (e) {}
     },
-    start: function (userId, username) {
-      var now = Date.now();
-      this._write({ userId: userId, username: username, issuedAt: now, expiresAt: now + TTL_MS });
-    },
-    // Returns the session, { expired:true }, or null. Slides expiry forward.
-    restore: function () {
-      var s = this._read();
-      if (!s || !s.userId) return null;
-      if (Date.now() > s.expiresAt) {
-        this.clear();
-        return { expired: true };
-      }
-      s.expiresAt = Date.now() + TTL_MS; // sliding renewal
-      this._write(s);
-      return s;
-    },
     touch: function () {
-      var s = this._read();
-      if (s && s.userId && Date.now() <= s.expiresAt) {
-        s.expiresAt = Date.now() + TTL_MS;
-        this._write(s);
-      }
+      var id = this.get();
+      if (id) this.set(id);
     },
     clear: function () {
       try {
-        localStorage.removeItem(SESSION_KEY);
+        localStorage.removeItem(ACTIVE_KEY);
       } catch (e) {}
     },
   };
 
-  // ---- RateLimiter (throttle rapid repeated login attempts) ----
-  var ATTEMPTS_KEY = 'pantry.auth.attempts.v1';
-  var MAX_ATTEMPTS = 5;
-  var WINDOW_MS = 60 * 1000;
-  var LOCK_MS = 30 * 1000;
-  var RateLimiter = {
-    _read: function () {
-      try {
-        return JSON.parse(localStorage.getItem(ATTEMPTS_KEY) || '{}') || {};
-      } catch (e) {
-        return {};
-      }
-    },
-    _write: function (m) {
-      try {
-        localStorage.setItem(ATTEMPTS_KEY, JSON.stringify(m));
-      } catch (e) {}
-    },
-    lockRemaining: function (username) {
-      var e = this._read()[String(username || '').toLowerCase()];
-      if (e && e.lockUntil && Date.now() < e.lockUntil) return e.lockUntil - Date.now();
-      return 0;
-    },
-    recordFailure: function (username) {
-      var m = this._read();
-      var k = String(username || '').toLowerCase();
-      var e = m[k] || { count: 0, first: Date.now() };
-      if (Date.now() - e.first > WINDOW_MS) e = { count: 0, first: Date.now() };
-      e.count++;
-      if (e.count >= MAX_ATTEMPTS) {
-        e.lockUntil = Date.now() + LOCK_MS;
-        e.count = 0;
-        e.first = Date.now();
-      }
-      m[k] = e;
-      this._write(m);
-    },
-    clear: function (username) {
-      var m = this._read();
-      delete m[String(username || '').toLowerCase()];
-      this._write(m);
-    },
-  };
-
-  // ---- CurrentUser (read-only context accessor used across the app) ----
+  // ---- UserContext (read-only accessor; exposed as window.CurrentUser) ----
   var _current = null;
-  var CurrentUser = {
+  var UserContext = {
     get: function () {
       return _current;
     },
@@ -321,81 +185,71 @@
     },
   };
 
-  // ---- AuthService (orchestrator; the app's only auth dependency) ----
+  // ---- UserMigration (password profiles -> open profiles; run once) ----
+  // Idempotent + interrupt-safe: guarded by a versioned flag; strips `cred`
+  // from every record (only after a successful rewrite) and removes obsolete
+  // password-era keys. Stable ids are preserved so all per-user data stays
+  // attached (inventory, lists, monthly plans, barcodes, products, images,
+  // settings, language) — nothing is lost.
+  var MIGRATION_FLAG = 'pantry.auth.passwordless.v1';
+  var OLD_SESSION_KEY = 'pantry.auth.session.v2';
+  var OLD_ATTEMPTS_KEY = 'pantry.auth.attempts.v1';
+  var UserMigration = {
+    done: function () {
+      try {
+        return localStorage.getItem(MIGRATION_FLAG) === '1';
+      } catch (e) {
+        return false;
+      }
+    },
+    run: function () {
+      if (this.done()) return false;
+      var d = UserRepository._load();
+      var changed = false;
+      Object.keys(d.users).forEach(function (id) {
+        var rec = d.users[id];
+        if (rec && rec.cred) {
+          delete rec.cred; // remove password hash/salt (only now, after read)
+          rec.updatedAt = new Date().toISOString();
+          changed = true;
+        }
+      });
+      if (changed) UserRepository._save(d);
+      // Drop obsolete password-era session + rate-limit state.
+      try {
+        localStorage.removeItem(OLD_SESSION_KEY);
+        localStorage.removeItem(OLD_ATTEMPTS_KEY);
+      } catch (e) {}
+      try {
+        localStorage.setItem(MIGRATION_FLAG, '1'); // checkpoint after success
+      } catch (e) {}
+      return true;
+    },
+  };
+
+  // ---- UserService (orchestrator; the app's only user dependency) ----
+  // Seed profiles preserved across the rebrand: Aviraz + a shared Guest.
   var DEMO_USERS = [
-    { id: 'aviraz', username: 'aviraz', password: 'aviraz', displayName: 'Aviraz' },
-    { id: 'test', username: 'test', password: 'test', displayName: 'Test User' },
+    { id: 'aviraz', username: 'aviraz', displayName: 'Aviraz' },
+    { id: 'guest', username: 'guest', displayName: 'Guest' },
   ];
 
   function seed() {
-    // Idempotent: create each demo user only if missing (never duplicates).
-    var chain = Promise.resolve();
     DEMO_USERS.forEach(function (u) {
-      chain = chain.then(function () {
-        if (UserRepository.exists(u.username)) return null;
-        return UserRepository.create(u);
-      });
+      if (!UserRepository.getById(u.id) && !UserRepository.exists(u.username)) {
+        UserRepository.create(u);
+      }
     });
-    return chain;
   }
 
-  var AuthService = {
-    // Async — seeds demo users with salted hashes on first startup.
+  var UserService = {
+    // Migrate old password profiles, then ensure demo profiles exist. Async for
+    // interface symmetry (nothing here actually awaits, but callers use .then).
     init: function () {
-      return seed();
-    },
-
-    // Async login. Resolves { ok:true, user } or
-    // { ok:false, error:'invalid'|'locked'|'empty', wait? }. Uses a generic
-    // error and always runs a hash verification to avoid user enumeration.
-    login: function (username, password) {
-      username = String(username || '').trim();
-      if (!username || password == null || password === '')
-        return Promise.resolve({ ok: false, error: 'empty' });
-      var lock = RateLimiter.lockRemaining(username);
-      if (lock > 0)
-        return Promise.resolve({ ok: false, error: 'locked', wait: Math.ceil(lock / 1000) });
-      var user = UserRepository.getByUsername(username);
-      var cred = user ? user.cred : null;
-      return CryptoHasher.verify(password, cred).then(function (okHash) {
-        if (user && okHash) {
-          RateLimiter.clear(username);
-          SessionManager.start(user.id, user.username);
-          CurrentUser._set(sanitize(user));
-          return { ok: true, user: sanitize(user) };
-        }
-        RateLimiter.recordFailure(username);
-        var lr = RateLimiter.lockRemaining(username);
-        if (lr > 0) return { ok: false, error: 'locked', wait: Math.ceil(lr / 1000) };
-        return { ok: false, error: 'invalid' };
+      return Promise.resolve().then(function () {
+        UserMigration.run();
+        seed();
       });
-    },
-
-    logout: function () {
-      SessionManager.clear();
-      CurrentUser._clear();
-    },
-
-    // Restore a persisted session on startup. Returns 'ok' | 'expired' | 'none'.
-    restore: function () {
-      var s = SessionManager.restore();
-      if (!s) return 'none';
-      if (s.expired) return 'expired';
-      var user = UserRepository.getById(s.userId);
-      if (!user) {
-        SessionManager.clear();
-        return 'none';
-      }
-      CurrentUser._set(sanitize(user));
-      return 'ok';
-    },
-
-    touchSession: function () {
-      SessionManager.touch();
-    },
-
-    isAuthenticated: function () {
-      return !!CurrentUser.get();
     },
 
     listUsers: function () {
@@ -406,36 +260,93 @@
       return sanitize(UserRepository.getById(id));
     },
 
-    // Update the current user's profile (display name / avatar / lang). Never
-    // touches credentials. Returns the sanitized, refreshed user.
+    // Enter a profile immediately (no password). Returns the sanitized user or
+    // null if the id no longer exists.
+    selectUser: function (id) {
+      var rec = UserRepository.getById(id);
+      if (!rec) return null;
+      ActiveUserManager.set(rec.id);
+      UserContext._set(sanitize(rec));
+      return sanitize(rec);
+    },
+
+    // Create a new open profile. Resolves { ok:true, user } or
+    // { ok:false, error:'empty'|'exists' }. Async for interface symmetry.
+    createUser: function (opts) {
+      opts = opts || {};
+      var displayName = String(opts.displayName || '').trim();
+      var username = String(opts.username || '').trim();
+      if (!displayName) return Promise.resolve({ ok: false, error: 'empty' });
+      // Prevent accidental duplicates when a username is provided.
+      if (username && UserRepository.exists(username))
+        return Promise.resolve({ ok: false, error: 'exists' });
+      var rec = UserRepository.create({
+        displayName: displayName,
+        username: username,
+        avatar: opts.avatar || null,
+        lang: opts.lang || null,
+      });
+      return Promise.resolve({ ok: true, user: sanitize(rec) });
+    },
+
+    // Update any profile by id.
+    updateUser: function (id, patch) {
+      return sanitize(UserRepository.update(id, patch));
+    },
+
+    // Update the active profile (display name / avatar / lang) and refresh ctx.
     updateProfile: function (patch) {
-      var id = CurrentUser.id();
+      var id = UserContext.id();
       if (!id) return null;
-      var rec = UserRepository.update(id, patch);
-      var s = sanitize(rec);
-      CurrentUser._set(s);
+      var s = sanitize(UserRepository.update(id, patch));
+      if (s) UserContext._set(s);
       return s;
     },
 
-    // Optional public registration hook (not wired into the demo UI).
-    register: function (opts) {
-      if (UserRepository.exists(opts.username))
-        return Promise.resolve({ ok: false, error: 'exists' });
-      return UserRepository.create(opts).then(function (rec) {
-        return { ok: true, user: sanitize(rec) };
-      });
+    // Delete a profile record. The caller is responsible for deleting that
+    // user's data (PantryDB.deleteUserData). The active profile cannot be
+    // deleted (switch away first).
+    deleteUser: function (id) {
+      if (!id || id === UserContext.id()) return false;
+      return UserRepository.remove(id);
     },
 
-    // Testing hooks (not used by the app).
+    // Restore the active profile on startup. Returns 'ok' | 'none'. If the
+    // stored profile no longer exists, falls back to the picker.
+    restore: function () {
+      var id = ActiveUserManager.get();
+      if (!id) return 'none';
+      var rec = UserRepository.getById(id);
+      if (!rec) {
+        ActiveUserManager.clear();
+        return 'none';
+      }
+      UserContext._set(sanitize(rec));
+      return 'ok';
+    },
+
+    // Clear only the active selection (deletes NO data).
+    logout: function () {
+      ActiveUserManager.clear();
+      UserContext._clear();
+    },
+
+    touchSession: function () {
+      ActiveUserManager.touch();
+    },
+
+    isAuthenticated: function () {
+      return !!UserContext.get();
+    },
+
+    // Testing hooks.
     _internals: {
-      CryptoHasher: CryptoHasher,
       UserRepository: UserRepository,
-      SessionManager: SessionManager,
-      RateLimiter: RateLimiter,
-      cryptoAvailable: !!subtle,
+      ActiveUserManager: ActiveUserManager,
+      UserMigration: UserMigration,
     },
   };
 
-  window.Auth = AuthService;
-  window.CurrentUser = CurrentUser;
+  window.Auth = UserService;
+  window.CurrentUser = UserContext;
 })();

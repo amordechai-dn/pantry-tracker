@@ -1,6 +1,6 @@
 /* Service worker: precache + cache-first, offline-capable, self-updating.
    Bump VERSION on every deploy to trigger an update for installed PWAs. */
-var VERSION = 'v1.6.0';
+var VERSION = 'v1.7.0';
 var CACHE = 'pantry-' + VERSION;
 
 // Critical-path assets for first paint + full offline. Kept lean: only what
@@ -21,6 +21,8 @@ var ASSETS = [
   './vendor/zxing.min.js',
   './data/foods.js',
   './manifest.webmanifest',
+  './icons/icon-16.png',
+  './icons/icon-32.png',
   './icons/icon-192.png',
   './icons/icon-512.png',
   './icons/apple-touch-icon-180.png',

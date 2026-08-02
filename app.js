@@ -1,4 +1,4 @@
-/* Pantry Tracker — vanilla client-side app logic. Global `App`. */
+/* HomeStock — Smart Home Inventory. Vanilla client-side app logic. Global `App`. */
 (function () {
   'use strict';
 
@@ -2235,206 +2235,284 @@
     document.body.appendChild(overlay);
   }
 
-  // ---- Login screen (shown when no user is signed in) ----
-  function renderLogin(opts) {
-    opts = opts || {};
-    if (!root) root = document.getElementById('root');
-    // Clear any leftover overlays/sheets and the main UI.
-    Array.prototype.slice
-      .call(document.querySelectorAll('.overlay, .toast'))
-      .forEach(function (o) { o.remove(); });
-    root.innerHTML = '';
-
-    // Language selector (before login) — segmented EN / עברית.
-    var langSel = h('div', { class: 'segment auth-lang' });
-    [['en', 'English'], ['he', 'עברית']].forEach(function (pair) {
-      langSel.appendChild(
-        h(
-          'button',
-          {
-            class: 'segment-item' + (window.I18N.getLang() === pair[0] ? ' active' : ''),
-            type: 'button',
-            onclick: function () {
-              if (window.I18N.getLang() !== pair[0]) {
-                window.I18N.setLang(pair[0]);
-                renderLogin(opts);
-              }
-            },
-          },
-          pair[1]
-        )
-      );
-    });
-
-    var userInput = h('input', {
-      class: 'input', type: 'text', placeholder: t('auth.usernamePlaceholder'),
-      'aria-label': t('auth.username'),
-      autocomplete: 'username', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false',
-    });
-
-    // Password field with show/hide toggle.
-    var passInput = h('input', {
-      class: 'input', type: 'password', placeholder: t('auth.passwordPlaceholder'),
-      'aria-label': t('auth.password'), autocomplete: 'current-password',
-    });
-    var pwToggle = h(
-      'button',
-      {
-        class: 'pw-toggle', type: 'button', 'aria-label': t('auth.showPassword'),
-        onclick: function () {
-          var show = passInput.type === 'password';
-          passInput.type = show ? 'text' : 'password';
-          pwToggle.textContent = show ? '🙈' : '👁';
-          pwToggle.setAttribute('aria-label', show ? t('auth.hidePassword') : t('auth.showPassword'));
-          passInput.focus();
-        },
-      },
-      '👁'
-    );
-    var pwWrap = h('div', { class: 'pw-wrap' }, passInput, pwToggle);
-
-    var errEl = h('div', { class: 'auth-error', style: 'display:none' });
-    if (opts.expired) {
-      errEl.textContent = t('auth.sessionExpired');
-      errEl.style.display = 'block';
-    }
-    function showError(msg) {
-      errEl.textContent = msg;
-      errEl.style.display = 'block';
-    }
-
-    var submitBtn = h(
-      'button',
-      { class: 'btn save auth-submit', type: 'button', onclick: function () { submit(); } },
-      t('auth.login')
-    );
-    var submitting = false;
-    function setLoading(b) {
-      submitting = b;
-      submitBtn.disabled = b;
-      userInput.disabled = b;
-      passInput.disabled = b;
-      submitBtn.classList.toggle('loading', b);
-      submitBtn.textContent = b ? t('auth.loggingIn') : t('auth.login');
-    }
-
-    function submit() {
-      if (submitting) return;
-      var u = userInput.value;
-      var p = passInput.value;
-      if (!u.trim() || !p) {
-        showError(t('auth.errorEmpty'));
-        (!u.trim() ? userInput : passInput).classList.add('error');
-        return;
-      }
-      setLoading(true);
-      window.Auth.login(u, p).then(function (res) {
-        setLoading(false);
-        if (res.ok) {
-          enterApp().then(function () {
-            showToast(t('auth.welcome', { name: window.CurrentUser.displayName() }));
-          });
-          return;
-        }
-        if (res.error === 'locked') {
-          showError(t('auth.tooManyAttempts', { seconds: res.wait }));
-          return;
-        }
-        // Generic message — never reveals whether the username exists.
-        showError(t('auth.invalidCredentials'));
-        passInput.classList.add('error');
-      });
-    }
-
-    [userInput, passInput].forEach(function (inp) {
-      inp.addEventListener('input', function () {
-        errEl.style.display = 'none';
-        inp.classList.remove('error');
-      });
-      inp.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter') submit();
-      });
-    });
-
-    var card = h(
-      'div',
-      { class: 'auth-card' },
-      h('div', { class: 'auth-logo', text: '🧺' }),
-      h('h1', { class: 'auth-title', text: t('auth.title') }),
-      h('p', { class: 'auth-subtitle', text: t('auth.subtitle') }),
-      langSel,
-      h('label', { class: 'field-label', text: t('auth.username') }),
-      userInput,
-      h('label', { class: 'field-label', text: t('auth.password') }),
-      pwWrap,
-      errEl,
-      submitBtn,
-      h('p', { class: 'auth-hint', text: t('auth.demoHint') })
-    );
-    root.appendChild(h('div', { class: 'auth-screen' }, card));
-    setTimeout(function () { userInput.focus(); }, 50);
+  // ---- Shared helpers for the passwordless profile UI ----
+  function initialsOf(name) {
+    var parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+    if (!parts.length) return '?';
+    if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
   }
 
-  // ---- User profile (avatar / display name / language / logout) ----
-  function openProfile() {
-    var cu = window.CurrentUser;
-    var overlay = h('div', { class: 'overlay center' });
-    function close() { overlay.remove(); }
-    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
-
-    var av = { image: cu.avatar() };
-    var avatarBox = h('div', { class: 'profile-avatar' });
+  // Reusable avatar picker bound to state.avatar (a data URL or null). The
+  // placeholder shows initials via getInitials(). Used by create/edit/profile.
+  function avatarControl(state, getInitials) {
+    var box = h('div', { class: 'profile-avatar' });
     var fileInput = h('input', { class: 'photo-file', type: 'file', accept: 'image/*' });
-    function renderAvatar() {
-      avatarBox.innerHTML = '';
-      var tile = av.image
-        ? h('div', { class: 'avatar lg has-img' }, h('img', { class: 'avatar-img', src: av.image, alt: '' }))
-        : h('div', { class: 'avatar lg', text: cu.initials() });
+    function render() {
+      box.innerHTML = '';
+      var tile = state.avatar
+        ? h('div', { class: 'avatar lg has-img' }, h('img', { class: 'avatar-img', src: state.avatar, alt: '' }))
+        : h('div', { class: 'avatar lg', text: getInitials() });
       var addBtn = h('button', { class: 'btn ghost', type: 'button', onclick: function () { fileInput.click(); } },
-        av.image ? t('auth.changeAvatar') : t('auth.addAvatar'));
-      var rm = av.image
-        ? h('button', { class: 'btn ghost danger', type: 'button', onclick: function () { av.image = null; renderAvatar(); } }, t('auth.removeAvatar'))
+        state.avatar ? t('auth.changeAvatar') : t('auth.addAvatar'));
+      var rm = state.avatar
+        ? h('button', { class: 'btn ghost danger', type: 'button', onclick: function () { state.avatar = null; render(); } }, t('auth.removeAvatar'))
         : null;
-      avatarBox.appendChild(tile);
-      avatarBox.appendChild(h('div', { class: 'photo-actions', style: 'justify-content:center' }, addBtn, rm));
+      box.appendChild(tile);
+      box.appendChild(h('div', { class: 'photo-actions', style: 'justify-content:center' }, addBtn, rm));
     }
     fileInput.addEventListener('change', function () {
       var f = fileInput.files && fileInput.files[0];
       if (!f) return;
       processImage(f, function (pair) {
-        // Avatars are small — store the compact thumb variant (WebP if supported).
-        if (pair) { av.image = pair.thumb || pair.full; renderAvatar(); }
+        if (pair) { state.avatar = pair.thumb || pair.full; render(); }
         else showToast(t('form.imageError'));
         fileInput.value = '';
       });
     });
-    renderAvatar();
+    render();
+    return { box: box, input: fileInput, rerender: render };
+  }
 
-    var nameInput = h('input', { class: 'input', type: 'text', value: cu.displayName() || '', 'aria-label': t('auth.displayName') });
+  // Local EN/עברית segmented control bound to a mutable `state.lang`.
+  function langSegment(state) {
+    var box = h('div', { class: 'segment' });
+    function render() {
+      box.innerHTML = '';
+      [['en', 'English'], ['he', 'עברית']].forEach(function (p) {
+        box.appendChild(h('button', {
+          class: 'segment-item' + (state.lang === p[0] ? ' active' : ''),
+          type: 'button',
+          onclick: function () { state.lang = p[0]; render(); },
+        }, p[1]));
+      });
+    }
+    render();
+    return box;
+  }
 
-    // Language segmented control (per-user).
-    var langSel = h('div', { class: 'segment' });
+  // ---- Profile picker (shown when no active user / on switch) ----
+  // Open household profiles: tap to enter immediately, no password.
+  function renderPicker() {
+    if (!root) root = document.getElementById('root');
+    Array.prototype.slice
+      .call(document.querySelectorAll('.overlay, .toast'))
+      .forEach(function (o) { o.remove(); });
+    root.innerHTML = '';
+
+    // Shared language toggle (also the default language for new profiles).
+    var langSel = h('div', { class: 'segment auth-lang' });
     [['en', 'English'], ['he', 'עברית']].forEach(function (pair) {
       langSel.appendChild(
         h('button', {
           class: 'segment-item' + (window.I18N.getLang() === pair[0] ? ' active' : ''),
           type: 'button',
           onclick: function () {
-            if (window.I18N.getLang() !== pair[0]) {
-              window.I18N.setLang(pair[0]);
-              window.Auth.updateProfile({ lang: pair[0] });
-              renderMain();
-              close();
-              openProfile();
-            }
+            if (window.I18N.getLang() !== pair[0]) { window.I18N.setLang(pair[0]); renderPicker(); }
           },
         }, pair[1])
       );
     });
 
+    var activeId = window.CurrentUser ? window.CurrentUser.id() : null;
+    var users = window.Auth.listUsers();
+
+    function pick(id) {
+      var u = window.Auth.selectUser(id);
+      if (!u) { renderPicker(); return; }
+      enterApp().then(function () {
+        showToast(t('auth.welcome', { name: window.CurrentUser.displayName() }));
+      });
+    }
+
+    var grid = h('div', { class: 'user-grid' });
+    users.forEach(function (u) {
+      var av = u.avatar
+        ? h('div', { class: 'avatar xl has-img' }, h('img', { class: 'avatar-img', src: u.avatar, alt: '' }))
+        : h('div', { class: 'avatar xl', text: initialsOf(u.displayName || u.username) });
+      grid.appendChild(
+        h('div', { class: 'user-card' + (u.id === activeId ? ' active' : ''), onclick: function () { pick(u.id); } },
+          u.id === activeId ? h('span', { class: 'user-active-badge', text: t('auth.activeUser') }) : null,
+          h('button', {
+            class: 'user-edit-btn', type: 'button', 'aria-label': t('auth.editUser'), title: t('auth.editUser'),
+            onclick: function (e) { e.stopPropagation(); renderEditUser(u); },
+          }, '✏️'),
+          av,
+          h('div', { class: 'user-card-name', text: u.displayName || u.username }),
+          u.username ? h('div', { class: 'user-card-sub', text: '@' + u.username }) : null
+        )
+      );
+    });
+    // "Add user" card.
+    grid.appendChild(
+      h('div', { class: 'user-card user-add', onclick: function () { renderCreateUser(); } },
+        h('div', { class: 'user-add-plus', text: '＋' }),
+        h('div', { class: 'user-card-name', text: t('auth.addUser') })
+      )
+    );
+
+    root.appendChild(
+      h('div', { class: 'picker-screen' },
+        h('img', { class: 'brand-logo', src: './icons/icon-192.png', alt: '' }),
+        h('h1', { class: 'auth-title', text: t('app.title') }),
+        h('p', { class: 'auth-subtitle', text: t('auth.chooseUser') }),
+        langSel,
+        grid
+      )
+    );
+  }
+
+  // ---- Create profile ----
+  function renderCreateUser() {
+    var overlay = h('div', { class: 'overlay center' });
+    function close() { overlay.remove(); }
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+
+    var state = { avatar: null, lang: window.I18N.getLang() };
+    var nameInput = h('input', { class: 'input', type: 'text', placeholder: t('auth.displayNamePlaceholder'), 'aria-label': t('auth.displayName') });
+    var userInput = h('input', {
+      class: 'input', type: 'text', placeholder: t('auth.usernamePlaceholder'), 'aria-label': t('auth.username'),
+      autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false',
+    });
+    var avc = avatarControl(state, function () { return initialsOf(nameInput.value); });
+    nameInput.addEventListener('input', function () { nameInput.classList.remove('error'); avc.rerender(); });
+    var langBox = langSegment(state);
+    var errEl = h('div', { class: 'auth-error', style: 'display:none' });
+
+    function create() {
+      var dn = nameInput.value.trim();
+      if (!dn) {
+        nameInput.classList.add('error');
+        errEl.textContent = t('auth.displayNameRequired');
+        errEl.style.display = 'block';
+        nameInput.focus();
+        return;
+      }
+      window.Auth.createUser({ displayName: dn, username: userInput.value.trim(), avatar: state.avatar, lang: state.lang })
+        .then(function (res) {
+          if (!res.ok) {
+            errEl.textContent = res.error === 'exists' ? t('auth.usernameTaken') : t('auth.displayNameRequired');
+            errEl.style.display = 'block';
+            return;
+          }
+          close();
+          window.Auth.selectUser(res.user.id);
+          enterApp().then(function () { showToast(t('auth.userCreated')); });
+        });
+    }
+
+    var dialog = h('div', { class: 'dialog profile-dialog' },
+      h('div', { class: 'sheet-header' },
+        h('h2', { class: 'dialog-title', text: t('auth.createUserTitle') }),
+        h('button', { class: 'sheet-close', 'aria-label': 'X', onclick: close }, '✕')
+      ),
+      avc.box, avc.input,
+      h('label', { class: 'field-label', text: t('auth.displayName') }), nameInput,
+      h('label', { class: 'field-label', text: t('auth.usernameOptional') }), userInput,
+      h('label', { class: 'field-label', text: t('auth.preferredLanguage') }), langBox,
+      errEl,
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn cancel', type: 'button', onclick: close }, t('form.cancel')),
+        h('button', { class: 'btn save', type: 'button', onclick: create }, t('auth.createButton'))
+      )
+    );
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    setTimeout(function () { nameInput.focus(); }, 50);
+  }
+
+  // ---- Edit / delete a profile (from the picker) ----
+  function renderEditUser(u) {
+    var overlay = h('div', { class: 'overlay center' });
+    function close() { overlay.remove(); }
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+
+    var isActive = !!(window.CurrentUser && window.CurrentUser.id() === u.id);
+    var state = { avatar: u.avatar || null, lang: u.lang || window.I18N.getLang() };
+    var nameInput = h('input', { class: 'input', type: 'text', value: u.displayName || u.username || '', 'aria-label': t('auth.displayName') });
+    var avc = avatarControl(state, function () { return initialsOf(nameInput.value); });
+    nameInput.addEventListener('input', function () { avc.rerender(); });
+    var langBox = langSegment(state);
+
     function save() {
-      var patch = { avatar: av.image, displayName: nameInput.value.trim() || cu.username() };
-      window.Auth.updateProfile(patch);
+      var dn = nameInput.value.trim() || u.username || u.displayName || '';
+      window.Auth.updateUser(u.id, { displayName: dn, avatar: state.avatar, lang: state.lang });
+      if (isActive) {
+        window.Auth.updateProfile({ displayName: dn, avatar: state.avatar, lang: state.lang });
+        if (window.I18N.getLang() !== state.lang) window.I18N.setLang(state.lang);
+      }
+      close();
+      renderPicker();
+    }
+    function del() {
+      if (isActive) { showToast(t('auth.cannotDeleteActive')); return; }
+      confirmDeleteUser(u, function () { close(); renderPicker(); });
+    }
+
+    var dialog = h('div', { class: 'dialog profile-dialog' },
+      h('div', { class: 'sheet-header' },
+        h('h2', { class: 'dialog-title', text: t('auth.editUserTitle') }),
+        h('button', { class: 'sheet-close', 'aria-label': 'X', onclick: close }, '✕')
+      ),
+      avc.box, avc.input,
+      h('label', { class: 'field-label', text: t('auth.displayName') }), nameInput,
+      u.username ? h('label', { class: 'field-label', text: t('auth.username') }) : null,
+      u.username ? h('div', { class: 'profile-username', text: '@' + u.username }) : null,
+      h('label', { class: 'field-label', text: t('auth.preferredLanguage') }), langBox,
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn danger' + (isActive ? ' disabled' : ''), type: 'button', onclick: del }, t('auth.deleteUser')),
+        h('button', { class: 'btn save', type: 'button', onclick: save }, t('auth.save'))
+      )
+    );
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+  }
+
+  // Explicit destructive confirmation before deleting a profile + its data.
+  function confirmDeleteUser(u, onDone) {
+    var overlay = h('div', { class: 'overlay center' });
+    function close() { overlay.remove(); }
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+    var name = u.displayName || u.username || '';
+    var dialog = h('div', { class: 'dialog' },
+      h('h2', { class: 'dialog-title', text: t('auth.confirmDeleteTitle') }),
+      h('p', { class: 'dialog-msg', text: t('auth.confirmDeleteMsg', { name: name }) }),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn cancel', type: 'button', onclick: close }, t('form.cancel')),
+        h('button', {
+          class: 'btn danger', type: 'button',
+          onclick: function () {
+            window.Auth.deleteUser(u.id);
+            window.PantryDB.deleteUserData(u.id).then(function () {
+              close();
+              showToast(t('auth.userDeleted'));
+              if (onDone) onDone();
+            });
+          },
+        }, t('auth.deleteUser'))
+      )
+    );
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+  }
+
+  // ---- Active-user profile (edit self, switch, choose another) ----
+  function openProfile() {
+    var cu = window.CurrentUser;
+    var overlay = h('div', { class: 'overlay center' });
+    function close() { overlay.remove(); }
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+
+    var state = { avatar: cu.avatar(), lang: window.I18N.getLang() };
+    var nameInput = h('input', { class: 'input', type: 'text', value: cu.displayName() || '', 'aria-label': t('auth.displayName') });
+    var avc = avatarControl(state, function () { return initialsOf(nameInput.value) || cu.initials(); });
+    nameInput.addEventListener('input', function () { avc.rerender(); });
+    var langBox = langSegment(state);
+
+    function save() {
+      var dn = nameInput.value.trim() || cu.username() || cu.displayName();
+      window.Auth.updateProfile({ displayName: dn, avatar: state.avatar, lang: state.lang });
+      if (window.I18N.getLang() !== state.lang) window.I18N.setLang(state.lang);
       renderMain();
       close();
     }
@@ -2446,40 +2524,23 @@
         h('h2', { class: 'dialog-title', text: t('auth.profile') }),
         h('button', { class: 'sheet-close', 'aria-label': 'X', onclick: close }, '✕')
       ),
-      avatarBox,
-      fileInput,
+      avc.box,
+      avc.input,
       h('label', { class: 'field-label', text: t('auth.displayName') }),
       nameInput,
-      h('label', { class: 'field-label', text: t('auth.username') }),
-      h('div', { class: 'profile-username', text: '@' + cu.username() }),
+      cu.username() ? h('label', { class: 'field-label', text: t('auth.username') }) : null,
+      cu.username() ? h('div', { class: 'profile-username', text: '@' + cu.username() }) : null,
       h('label', { class: 'field-label', text: t('auth.preferredLanguage') }),
-      langSel,
+      langBox,
+      h('button', { class: 'btn ghost profile-switch', type: 'button', onclick: function () { close(); renderPicker(); } }, t('auth.switchUser')),
       h('div', { class: 'actions' },
-        h('button', { class: 'btn cancel', type: 'button', onclick: function () { confirmLogout(); } }, t('auth.logout')),
+        h('button', { class: 'btn cancel', type: 'button', onclick: function () { close(); chooseAnother(); } }, t('auth.chooseAnother')),
         h('button', { class: 'btn save', type: 'button', onclick: save }, t('auth.save'))
       )
     );
     overlay.appendChild(dialog);
     document.body.appendChild(overlay);
     setTimeout(function () { nameInput.focus(); }, 50);
-  }
-
-  function confirmLogout() {
-    var overlay = h('div', { class: 'overlay center' });
-    function close() { overlay.remove(); }
-    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
-    var dialog = h(
-      'div',
-      { class: 'dialog' },
-      h('h2', { class: 'dialog-title', text: t('auth.confirmLogoutTitle') }),
-      h('p', { class: 'dialog-msg', text: t('auth.confirmLogoutMsg') }),
-      h('div', { class: 'actions' },
-        h('button', { class: 'btn cancel', type: 'button', onclick: close }, t('form.cancel')),
-        h('button', { class: 'btn danger', type: 'button', onclick: function () { close(); doLogout(); } }, t('auth.logout'))
-      )
-    );
-    overlay.appendChild(dialog);
-    document.body.appendChild(overlay);
   }
 
   // ---- Auth / boot ----
@@ -2499,24 +2560,24 @@
       });
   }
 
-  function doLogout() {
+  // Clear only the active selection and return to the picker (deletes NO data).
+  function chooseAnother() {
     window.Auth.logout();
     window.PantryDB.setUser(null); // drop data scope
-    window.I18N.setUser(null); // back to shared login-screen language
+    window.I18N.setUser(null); // back to the shared picker language
     items = [];
-    renderLogin();
-    showToast(t('auth.loggedOut'));
+    renderPicker();
   }
 
-  // Seed the optional second demo user's inventory with distinct sample data so
+  // Seed the shared Guest profile's inventory with distinct sample data so
   // per-user isolation is visibly demonstrable. Runs once (flag-guarded).
-  function seedTestUserData() {
-    var FLAG = 'pantry.seed.test.v1';
+  function seedGuestUserData() {
+    var FLAG = 'pantry.seed.guest.v1';
     try {
       if (localStorage.getItem(FLAG)) return Promise.resolve();
     } catch (e) {}
-    if (!window.Auth.getUser('test')) return Promise.resolve();
-    window.PantryDB.setUser('test');
+    if (!window.Auth.getUser('guest')) return Promise.resolve();
+    window.PantryDB.setUser('guest');
     return window.PantryDB.getAll().then(function (existing) {
       var chain = Promise.resolve();
       if (!existing || !existing.length) {
@@ -2537,21 +2598,20 @@
   }
 
   function start() {
-    window.I18N.init(); // shared language for the login screen
-    window.Auth.init() // seed demo users (async: salted hashing)
-      .then(function () { return seedTestUserData(); })
+    window.I18N.init(); // shared language for the picker
+    window.Auth.init() // migrate old password profiles -> open profiles; seed demos
+      .then(function () { return seedGuestUserData(); })
       .then(function () {
         // One-time migration of any pre-auth data into the seeded 'aviraz' user.
         return window.PantryDB.migrateLegacyInto('aviraz');
       })
       .then(function () {
-        var st = window.Auth.restore(); // 'ok' | 'expired' | 'none'
+        var st = window.Auth.restore(); // 'ok' | 'none'
         if (st === 'ok') enterApp();
-        else if (st === 'expired') renderLogin({ expired: true });
-        else renderLogin();
+        else renderPicker();
       })
       .catch(function () {
-        renderLogin();
+        renderPicker();
       });
   }
 
