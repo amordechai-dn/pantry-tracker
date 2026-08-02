@@ -1,6 +1,6 @@
 /* Service worker: precache + cache-first, offline-capable, self-updating.
    Bump VERSION on every deploy to trigger an update for installed PWAs. */
-var VERSION = 'v1.12.0';
+var VERSION = 'v1.13.0';
 var CACHE = 'pantry-' + VERSION;
 
 // Critical-path assets for first paint + full offline. Kept lean: only what

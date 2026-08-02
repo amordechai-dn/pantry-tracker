@@ -552,6 +552,34 @@ async function rejects(name, fn) {
       return dc(QR.QRCodeMini.Ecc.LOW) === 21 && dc(QR.QRCodeMini.Ecc.HIGH) === 21;
     })());
 
+  console.log('\n[responsive: ONE shared Shopping List + space-based breakpoint]');
+  ok('single shared Shopping List renderer exists', typeof AppI.renderShoppingList === 'function');
+  ok('shared renderer takes a (container, mode) arg — used for BOTH modes',
+    AppI.renderShoppingList.length >= 2);
+  ok('breakpoint is space-based at 1024px (no user-agent detection)', AppI.BREAKPOINT === 1024);
+  [[375, 'page'], [430, 'page'], [768, 'page'], [1023, 'page'],
+   [1024, 'sidebar'], [1280, 'sidebar'], [1440, 'sidebar']].forEach(function (pair) {
+    ok('width ' + pair[0] + ' -> ' + pair[1] + ' mode',
+      AppI.layoutModeForWidth(pair[0]) === pair[1]);
+  });
+  // BOTH modes derive from the SAME single source (computeShortfall over items),
+  // so the sidebar and the page always show identical data — no second list.
+  var sf = AppI.computeShortfall([
+    { id: 'sa', quantity: 1, desiredAmount: 3, unit: 'pcs' }, // below target -> in list
+    { id: 'sb', quantity: 5, desiredAmount: 2, unit: 'pcs' }, // above target -> excluded
+    { id: 'sc', quantity: 0, desiredAmount: 0, unit: 'pcs' }, // no target    -> excluded
+  ]);
+  ok('shopping list derives only below-target items (shared logic)', sf.length === 1 && sf[0].id === 'sa');
+  ok('derived required-quantity is target - have', sf[0].missing === 2 && sf[0].have === 1 && sf[0].target === 3);
+  // New Shopping List strings present in BOTH languages (parity test covers the
+  // rest; spot-check the user-facing ones are real translations).
+  ['shopping.title', 'shopping.addItem', 'shopping.empty', 'shopping.need',
+   'shopping.markRestocked', 'shopping.remove', 'shopping.collapse', 'shopping.expand'].forEach(function (k) {
+    I18N.setLang('en'); var en = I18N.t(k);
+    I18N.setLang('he'); var he = I18N.t(k);
+    ok(k + ' (en+he present, non-key)', en !== k && he !== k);
+  });
+
   console.log('\n============================');
   console.log('PASS ' + pass + '  FAIL ' + fail);
   console.log('============================');

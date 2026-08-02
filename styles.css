@@ -129,6 +129,139 @@ body {
 .list {
   padding-inline: 20px;
 }
+
+/* ---- Responsive layout + shared Shopping List ---- */
+/* Mobile (default): single column. .main-layout is plain block flow; the
+   Shopping List is reached as its own page (renderShopping). */
+.shopping-page {
+  padding-inline: 20px;
+  padding-block-start: 4px;
+}
+/* Shared Shopping List presentation (identical in sidebar + page modes). */
+.shopping-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-block: 4px 12px;
+}
+.shopping-emoji {
+  font-size: 18px;
+}
+.shopping-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 800;
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+}
+.shopping-collapse {
+  margin-inline-start: auto;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted);
+  cursor: pointer;
+  line-height: 1;
+}
+.shopping-add {
+  width: 100%;
+  margin-block-end: 12px;
+}
+.shopping-items {
+  display: flex;
+  flex-direction: column;
+}
+.shopping-row {
+  gap: 10px;
+}
+.shopping-check {
+  inline-size: 22px;
+  block-size: 22px;
+  flex: 0 0 auto;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+.shopping-remove {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+.shopping-remove:active {
+  opacity: 0.6;
+}
+.shopping-empty {
+  text-align: center;
+  color: var(--muted);
+  padding-block: 28px;
+}
+.shopping-empty-emoji {
+  font-size: 30px;
+}
+.shopping-empty-text {
+  margin-block-start: 6px;
+  font-size: 14px;
+}
+
+/* Desktop (>= 1024px): two columns via grid areas (logical, RTL-safe — in
+   Hebrew the panel automatically moves to the inline-end/left side). */
+@media (min-width: 1024px) {
+  #root {
+    max-width: 1180px;
+  }
+  .main-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 360px;
+    grid-template-areas: "content aside";
+    gap: 24px;
+    padding-inline: 20px;
+    align-items: start;
+  }
+  .content-col {
+    grid-area: content;
+    min-width: 0;
+  }
+  .content-col .list {
+    padding-inline: 0; /* the grid provides the inline padding */
+  }
+  .shopping-panel {
+    grid-area: aside;
+    position: sticky;
+    top: 16px;
+    align-self: start;
+    max-height: calc(100vh - 32px);
+    display: flex;
+    flex-direction: column;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    box-shadow: var(--shadow-card);
+    transition: box-shadow 0.25s ease;
+  }
+  .shopping-panel-inner {
+    overflow-y: auto; /* only the panel content scrolls when long */
+    padding: 16px;
+  }
+  /* Brief highlight when the Shopping List nav focuses the panel. */
+  .shopping-panel.flash {
+    box-shadow: 0 0 0 3px var(--primary);
+  }
+  /* Inside the panel each row sits on the panel surface — flatten the cards. */
+  .shopping-panel .shopping-row {
+    box-shadow: none;
+    border: 1px solid var(--border);
+    padding: 10px;
+  }
+}
 .section-header {
   display: flex;
   align-items: center;

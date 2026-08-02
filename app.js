@@ -673,8 +673,8 @@
     else e.consumed += -delta;
     window.PantryDB.setMonthlyLog(log);
   }
-  function computeShortfall() {
-    return items
+  function computeShortfall(src) {
+    return (src || items)
       .filter(function (i) {
         return (i.desiredAmount || 0) > 0 && i.quantity < i.desiredAmount;
       })
@@ -705,25 +705,266 @@
   // rebuilds just the restock section (O(shortfall)) instead of re-rendering
   // the entire list (O(n)) on every tap.
   var cardRefs = {};
-  var restockSectionEl = null;
 
-  // (Re)build the "To restock" section into its container.
-  function renderRestockInto(container) {
+  // ---- Responsive layout / shared Shopping List ----
+  // The "To restock" list (items below their target) IS the Shopping List. It
+  // is rendered by ONE shared renderer (renderShoppingList) used in two modes:
+  //   - 'sidebar' : desktop side panel next to inventory (>= BREAKPOINT)
+  //   - 'page'    : mobile dedicated full-width page (< BREAKPOINT)
+  // Only one instance is ever mounted at a time (tracked by shoppingListEl).
+  var BREAKPOINT = 1024;
+  var mqWide = null; // cached MediaQueryList
+  var shoppingListEl = null; // the currently-mounted shared list container
+  var shoppingListMode = null; // 'sidebar' | 'page'
+  var currentView = 'inventory'; // mobile page selection ('inventory'|'shopping')
+  var SHOP_COLLAPSE_KEY = 'pantry.shoppingPanel.collapsed';
+
+  // Pure breakpoint mapping (space-based, no user-agent sniffing) — testable.
+  function layoutModeForWidth(w) {
+    return w >= BREAKPOINT ? 'sidebar' : 'page';
+  }
+  function isWide() {
+    if (!mqWide && typeof window.matchMedia === 'function') {
+      mqWide = window.matchMedia('(min-width: ' + BREAKPOINT + 'px)');
+    }
+    return mqWide ? mqWide.matches : false;
+  }
+  function shopCollapsed() {
+    try {
+      return localStorage.getItem(SHOP_COLLAPSE_KEY) === '1';
+    } catch (e) {
+      return false;
+    }
+  }
+  function setShopCollapsed(v) {
+    try {
+      localStorage.setItem(SHOP_COLLAPSE_KEY, v ? '1' : '0');
+    } catch (e) {}
+  }
+
+  // THE single shared Shopping List renderer (both sidebar + page modes).
+  function renderShoppingList(container, mode) {
+    shoppingListEl = container;
+    shoppingListMode = mode;
     container.innerHTML = '';
+    var collapsed = mode === 'sidebar' && shopCollapsed();
     var shortfall = computeShortfall();
-    if (!shortfall.length) return;
+
+    var head = h(
+      'div',
+      { class: 'shopping-head' },
+      h('span', { class: 'shopping-emoji', 'aria-hidden': 'true', text: '🛒' }),
+      h('h2', { class: 'shopping-title', text: t('shopping.title') }),
+      h('span', { class: 'section-count', text: String(shortfall.length) })
+    );
+    if (mode === 'sidebar') {
+      head.appendChild(
+        h(
+          'button',
+          {
+            class: 'shopping-collapse',
+            type: 'button',
+            'aria-label': collapsed ? t('shopping.expand') : t('shopping.collapse'),
+            title: collapsed ? t('shopping.expand') : t('shopping.collapse'),
+            onclick: function () {
+              setShopCollapsed(!collapsed);
+              var panel = document.querySelector('.shopping-panel');
+              if (panel) panel.classList.toggle('collapsed', shopCollapsed());
+              renderShoppingList(container, mode);
+            },
+          },
+          collapsed ? '»' : '«'
+        )
+      );
+    }
+    container.appendChild(head);
+    if (collapsed) return; // header-only when collapsed
+
+    // Add-item control — reuses the existing add form (no second implementation).
     container.appendChild(
       h(
-        'div',
-        { class: 'section-header' },
-        h('span', { class: 'section-emoji', text: '🛒' }),
-        h('span', { class: 'section-title', text: t('restock.title') }),
-        h('span', { class: 'section-count', text: String(shortfall.length) })
+        'button',
+        {
+          class: 'btn ghost shopping-add',
+          type: 'button',
+          onclick: function () { openForm(null); },
+        },
+        '＋ ' + t('shopping.addItem')
       )
     );
+
+    if (!shortfall.length) {
+      container.appendChild(
+        h(
+          'div',
+          { class: 'shopping-empty' },
+          h('div', { class: 'shopping-empty-emoji', 'aria-hidden': 'true', text: '🎉' }),
+          h('div', { class: 'shopping-empty-text', text: t('shopping.empty') })
+        )
+      );
+      return;
+    }
+    var listWrap = h('div', { class: 'shopping-items' });
     shortfall.forEach(function (s) {
-      container.appendChild(renderRestockCard(itemById(s.id), s));
+      listWrap.appendChild(renderShoppingRow(itemById(s.id), s));
     });
+    container.appendChild(listWrap);
+  }
+
+  // One row of the shared Shopping List. Reuses inventory item data + actions.
+  function renderShoppingRow(item, s) {
+    var unit = t('units.' + item.unit);
+    var checkbox = h('input', {
+      type: 'checkbox',
+      class: 'shopping-check',
+      'aria-label': t('shopping.markRestocked'),
+    });
+    checkbox.addEventListener('change', function () { completeRestock(item); });
+    var quick = h(
+      'button',
+      {
+        class: 'step-btn primary',
+        'aria-label': t('a11y.increase'),
+        onclick: function (e) { e.stopPropagation(); changeQty(item, 1); },
+      },
+      '+'
+    );
+    var remove = h(
+      'button',
+      {
+        class: 'shopping-remove',
+        'aria-label': t('shopping.remove'),
+        title: t('shopping.remove'),
+        onclick: function (e) { e.stopPropagation(); removeFromShopping(item); },
+      },
+      '✕'
+    );
+    return h(
+      'div',
+      {
+        class: 'card shopping-row',
+        onclick: function () { openForm(item); },
+      },
+      checkbox,
+      itemThumb(item),
+      h(
+        'div',
+        { class: 'card-info' },
+        h('div', { class: 'card-name', dir: 'auto', text: itemName(item) }),
+        h('div', {
+          class: 'card-meta',
+          text: t('shopping.need', { missing: formatQty(s.missing), unit: unit }),
+        })
+      ),
+      remove,
+      quick
+    );
+  }
+
+  // Mark an item as restocked from the shopping list: fill it up to its target.
+  function completeRestock(item) {
+    var target = item.desiredAmount || 0;
+    if (target <= item.quantity) return;
+    var delta = target - item.quantity;
+    item.quantity = target;
+    window.PantryDB.put(item);
+    recordDelta(delta);
+    recomputeShortfall();
+    refreshAfterMutation(item);
+  }
+
+  // Remove an item from the shopping list without buying: lower its target to
+  // the current quantity so it is no longer "below target". Reversible via undo.
+  function removeFromShopping(item) {
+    var prevTarget = item.desiredAmount;
+    item.desiredAmount = item.quantity;
+    window.PantryDB.put(item);
+    recomputeShortfall();
+    refreshAfterMutation(item);
+    showToast(t('shopping.removed'), function () {
+      item.desiredAmount = prevTarget;
+      window.PantryDB.put(item);
+      recomputeShortfall();
+      refreshAfterMutation(item);
+    });
+  }
+
+  // Re-render the current base screen (mobile page vs. inventory+panel) without
+  // reloading data — used on breakpoint crossing and language change.
+  function renderCurrentView() {
+    if (currentView === 'shopping' && !isWide()) renderShopping();
+    else renderMain();
+  }
+
+  // After a data mutation: update the affected inventory card (if mounted) and
+  // the shared shopping list (if mounted). One list instance, one data source.
+  function refreshAfterMutation(item) {
+    var updatedCard = false;
+    if (item) {
+      var node = cardRefs[item.id];
+      if (node && node.parentNode) {
+        var fresh = renderCard(item);
+        cardRefs[item.id] = fresh;
+        node.parentNode.replaceChild(fresh, node);
+        updatedCard = true;
+      }
+    }
+    var updatedShop = false;
+    if (shoppingListEl && shoppingListEl.parentNode) {
+      renderShoppingList(shoppingListEl, shoppingListMode);
+      updatedShop = true;
+    }
+    if (!updatedCard && !updatedShop) renderCurrentView();
+  }
+
+  // Shopping List nav. Desktop: focus/expand the in-place side panel (no
+  // navigation away from inventory). Mobile: open the dedicated page.
+  function openShopping() {
+    if (isWide()) {
+      currentView = 'inventory';
+      var panel = document.querySelector('.shopping-panel');
+      if (panel) {
+        if (shopCollapsed()) {
+          setShopCollapsed(false);
+          panel.classList.remove('collapsed');
+          if (shoppingListEl) renderShoppingList(shoppingListEl, shoppingListMode);
+        }
+        panel.classList.add('flash');
+        try { panel.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (e) {}
+        setTimeout(function () { panel.classList.remove('flash'); }, 1200);
+      }
+    } else {
+      currentView = 'shopping';
+      renderShopping();
+    }
+  }
+
+  // Mobile dedicated Shopping List page (same shared renderer, 'page' mode).
+  function renderShopping() {
+    if (!root) root = document.getElementById('root');
+    currentView = 'shopping';
+    root.innerHTML = '';
+    root.appendChild(
+      screenTopBar(t('shopping.title'), function () {
+        currentView = 'inventory';
+        renderMain();
+      })
+    );
+    var page = h('div', { class: 'shopping-page' });
+    renderShoppingList(page, 'page');
+    root.appendChild(page);
+    // Keep the quick Add affordance available on the page too.
+    root.appendChild(
+      h(
+        'button',
+        {
+          class: 'fab',
+          'aria-label': t('fab.add'),
+          onclick: function () { openForm(null); },
+        },
+        '+'
+      )
+    );
   }
 
   // ---- Rendering (main screen) ----
@@ -750,8 +991,9 @@
         o.remove();
       });
     reopenTop = null;
-    // Re-render whichever base screen is currently active.
-    if (window.CurrentUser && window.CurrentUser.id()) renderMain();
+    // Re-render whichever base screen is currently active (inventory+panel,
+    // the mobile Shopping page, or the picker).
+    if (window.CurrentUser && window.CurrentUser.id()) renderCurrentView();
     else renderSwitchUser();
     try {
       window.scrollTo(0, y);
@@ -804,6 +1046,18 @@
       },
       '📅'
     );
+    // Shopping List entry point. Desktop: focus/expand the side panel in place.
+    // Mobile: open the dedicated Shopping List page.
+    var shoppingBtn = h(
+      'button',
+      {
+        class: 'icon-btn',
+        'aria-label': t('shopping.title'),
+        title: t('shopping.title'),
+        onclick: openShopping,
+      },
+      '🛒'
+    );
     var settingsBtn = h(
       'button',
       {
@@ -854,15 +1108,20 @@
       h(
         'div',
         { class: 'header-actions' },
-        h('div', { class: 'header-btn-row' }, monthlyBtn, langBtn, syncBtn, settingsBtn, profileBtn),
+        h('div', { class: 'header-btn-row' }, monthlyBtn, shoppingBtn, langBtn, syncBtn, settingsBtn, profileBtn),
         h('span', { class: 'version', id: 'version', text: window.APP_VERSION || '' })
       )
     );
     root.appendChild(header);
 
-    // Body
+    // Body: responsive two-column layout. The grid collapses to a single column
+    // below the breakpoint (CSS), and the side panel is only mounted on wide
+    // screens — on narrow screens the Shopping List lives on its own page.
+    var layout = h('div', { class: 'main-layout' });
+    var content = h('div', { class: 'content-col' });
+
     if (total === 0) {
-      root.appendChild(
+      content.appendChild(
         h(
           'div',
           { class: 'empty' },
@@ -873,14 +1132,7 @@
       );
     } else {
       var list = h('div', { class: 'list' });
-
-      // "To restock" section — kept in its own container so quantity changes
-      // can rebuild just this section without touching the rest of the list.
       cardRefs = {};
-      restockSectionEl = h('div', { class: 'restock-section' });
-      renderRestockInto(restockSectionEl);
-      list.appendChild(restockSectionEl);
-
       sections.forEach(function (s) {
         list.appendChild(
           h(
@@ -900,8 +1152,25 @@
           list.appendChild(card);
         });
       });
-      root.appendChild(list);
+      content.appendChild(list);
     }
+    layout.appendChild(content);
+
+    // Desktop: mount the ONE shared Shopping List as a sticky side panel.
+    // Mobile: leave it unmounted here (it opens as a dedicated page instead).
+    if (isWide()) {
+      var aside = h('aside', {
+        class: 'shopping-panel' + (shopCollapsed() ? ' collapsed' : ''),
+      });
+      var inner = h('div', { class: 'shopping-panel-inner' });
+      renderShoppingList(inner, 'sidebar');
+      aside.appendChild(inner);
+      layout.appendChild(aside);
+    } else {
+      shoppingListEl = null;
+      shoppingListMode = null;
+    }
+    root.appendChild(layout);
 
     // Floating actions: Scan (above) + Add.
     root.appendChild(
@@ -1051,17 +1320,9 @@
     window.PantryDB.put(item);
     recordDelta(real);
     recomputeShortfall();
-    // Targeted update: replace just this item's card (O(1)) and rebuild only
-    // the "To restock" section (O(shortfall)), avoiding a full list re-render.
-    var node = cardRefs[item.id];
-    if (node && node.parentNode) {
-      var fresh = renderCard(item);
-      cardRefs[item.id] = fresh;
-      node.parentNode.replaceChild(fresh, node);
-      if (restockSectionEl) renderRestockInto(restockSectionEl);
-    } else {
-      renderMain(); // fallback if the list isn't currently built
-    }
+    // Targeted update: refresh just the affected inventory card (O(1)) and the
+    // mounted shared Shopping List (O(shortfall)) — never a full re-render.
+    refreshAfterMutation(item);
   }
 
   function refresh() {
@@ -3660,8 +3921,23 @@
     });
   }
 
+  // Re-render on breakpoint crossing (space-based, via CSS matchMedia — NOT
+  // user-agent). Uses in-memory data, so inventory is never reloaded and the
+  // active user / current view is preserved. Fires only when the ~1024px line
+  // is crossed, not on every resize.
+  function watchBreakpoint() {
+    if (typeof window.matchMedia !== 'function') return;
+    mqWide = window.matchMedia('(min-width: ' + BREAKPOINT + 'px)');
+    var onChange = function () {
+      if (window.CurrentUser && window.CurrentUser.id()) renderCurrentView();
+    };
+    if (mqWide.addEventListener) mqWide.addEventListener('change', onChange);
+    else if (mqWide.addListener) mqWide.addListener(onChange); // older Safari
+  }
+
   function start() {
     window.I18N.init(); // shared language for the picker
+    watchBreakpoint();
     // Capture a device-link token from the URL (opened link / scanned QR) and
     // scrub it from the address bar; it is redeemed once a profile is active.
     pendingLinkToken = parseLinkToken();
@@ -3702,6 +3978,11 @@
       mapItemToCloud: mapItemToCloud,
       parseLinkToken: parseLinkToken,
       syncAutoRedeem: syncAutoRedeem,
+      // Responsive Shopping List — one shared renderer + pure breakpoint logic.
+      renderShoppingList: renderShoppingList,
+      layoutModeForWidth: layoutModeForWidth,
+      computeShortfall: computeShortfall,
+      BREAKPOINT: BREAKPOINT,
     },
   };
 })();

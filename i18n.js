@@ -80,6 +80,17 @@
         title: 'To restock',
         missing: '{{missing}} missing (have {{have}} of {{target}})',
       },
+      shopping: {
+        title: 'Shopping list',
+        addItem: 'Add item',
+        empty: "You're all stocked up",
+        need: 'Need {{missing}} {{unit}}',
+        markRestocked: 'Mark as restocked',
+        remove: 'Remove from list',
+        removed: 'Removed from list',
+        collapse: 'Collapse panel',
+        expand: 'Expand panel',
+      },
       scan: {
         button: 'Scan product',
         fabHint: 'Scan',
@@ -340,6 +351,17 @@
       restock: {
         title: 'רשימת קניות',
         missing: 'חסר {{missing}} (יש {{have}} מתוך {{target}})',
+      },
+      shopping: {
+        title: 'רשימת קניות',
+        addItem: 'הוספת פריט',
+        empty: 'הכול מלא במלאי',
+        need: 'חסר {{missing}} {{unit}}',
+        markRestocked: 'סימון כחודש',
+        remove: 'הסרה מהרשימה',
+        removed: 'הוסר מהרשימה',
+        collapse: 'כיווץ הפאנל',
+        expand: 'הרחבת הפאנל',
       },
       scan: {
         button: 'סריקת מוצר',
