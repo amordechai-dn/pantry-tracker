@@ -1368,6 +1368,60 @@ body {
   margin-block-start: 12px;
 }
 
+/* ---- Sync (Settings → Sync) ---- */
+.sync-subtitle {
+  color: var(--muted);
+  font-size: 14px;
+  margin: 0 0 12px;
+}
+.sync-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sync-body .btn {
+  flex: initial;
+  width: 100%;
+}
+.sync-body .input {
+  width: 100%;
+}
+.sync-note {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0;
+  line-height: 1.4;
+}
+.sync-note.sync-error {
+  color: var(--danger);
+}
+.sync-subhead {
+  font-size: 14px;
+  font-weight: 800;
+  margin: 14px 0 2px;
+}
+.sync-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+}
+.sync-status-glyph {
+  font-size: 18px;
+}
+.sync-link-area {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+.sync-indicator {
+  font-size: 16px;
+}
+
 /* Dev-only scanner debug panel (gated by ?debug=1 / localStorage flag). */
 .scan-debug {
   margin-block-start: 10px;

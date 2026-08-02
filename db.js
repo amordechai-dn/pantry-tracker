@@ -39,6 +39,19 @@
   // When true (only during migration), unscoped access is temporarily allowed.
   var _bypass = false;
 
+  // Optional mutation hook. Stays null (inert) unless the sync layer registers
+  // one via PantryDB.onMutation(). Fired AFTER a successful write so the sync
+  // queue can capture local changes. Never throws into the DB path.
+  var mutationHook = null;
+  function notifyMutation(table, opType, record) {
+    if (typeof mutationHook !== 'function') return;
+    try {
+      mutationHook({ table: table, opType: opType, record: record, userId: currentUser });
+    } catch (e) {
+      /* a broken hook must never break persistence */
+    }
+  }
+
   // Repository-level scope enforcement: every user-owned read/write must run
   // under an authenticated user (set via setUser) unless we are migrating.
   function scoped() {
@@ -215,12 +228,14 @@
       if (idx >= 0) arr[idx] = item;
       else arr.push(item);
       lsWrite(arr);
+      notifyMutation('inventoryItems', 'upsert', item);
       return Promise.resolve(item);
     }
     return tx('readwrite').then(function (store) {
       return new Promise(function (resolve, reject) {
         var req = store.put(item);
         req.onsuccess = function () {
+          notifyMutation('inventoryItems', 'upsert', item);
           resolve(item);
         };
         req.onerror = function () {
@@ -238,12 +253,14 @@
           return x.id !== id;
         })
       );
+      notifyMutation('inventoryItems', 'delete', { id: id });
       return Promise.resolve();
     }
     return tx('readwrite').then(function (store) {
       return new Promise(function (resolve, reject) {
         var req = store.delete(id);
         req.onsuccess = function () {
+          notifyMutation('inventoryItems', 'delete', { id: id });
           resolve();
         };
         req.onerror = function () {
@@ -296,12 +313,14 @@
       var map = bcLsRead();
       map[rec.barcode] = rec;
       bcLsWrite(map);
+      notifyMutation('barcodeMappings', 'upsert', rec);
       return Promise.resolve(rec);
     }
     return tx('readwrite', BC_STORE).then(function (store) {
       return new Promise(function (resolve) {
         var req = store.put(rec);
         req.onsuccess = function () {
+          notifyMutation('barcodeMappings', 'upsert', rec);
           resolve(rec);
         };
         req.onerror = function () {
@@ -571,5 +590,9 @@
     migrateLegacyInto: migrateLegacyInto,
     hasMigration: hasMigration,
     getMigrations: getMigrations,
+    // Optional sync hook — inert until the (lazy-loaded) sync layer registers.
+    onMutation: function (cb) {
+      mutationHook = typeof cb === 'function' ? cb : null;
+    },
   };
 })();

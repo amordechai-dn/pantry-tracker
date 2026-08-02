@@ -30,6 +30,11 @@
     <!-- vendor/zxing.min.js (~336KB) is NOT loaded here: it is lazy-loaded on
          first scanner open (see loadZXing in app.js) and precached by the SW so
          it still resolves from cache offline, keeping it off the startup path. -->
+    <!-- sync/homesync.js (the cross-device sync layer) is NOT loaded here: it
+         stays DORMANT and is lazy-loaded by app.js only once a Supabase URL +
+         anon key are configured AND a device is linked, so startup stays lean
+         and the app is 100% offline-first with no backend configured. -->
+    <script src="./config.js"></script>
     <script src="./data/foods.js"></script>
     <script src="./i18n.js"></script>
     <script src="./db.js"></script>

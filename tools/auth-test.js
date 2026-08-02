@@ -387,6 +387,123 @@ async function rejects(name, fn) {
   var after = JSON.stringify(Auth.listUsers().map(function (u) { return u.id + ':' + (u.displayName || ''); }).sort());
   ok('rapid switching leaves all profiles unchanged (no edits)', before === after);
 
+  // 21) Cross-device sync — PURE logic verified with stubs/mocks (no backend).
+  //     (End-to-end round-trip, RLS isolation, and a real 2nd device require a
+  //      live Supabase project — see sync/SYNC_SETUP.md.)
+  var HS = require('../sync/homesync.js');
+
+  console.log('\n[sync: dormant-by-default]');
+  ok('HomeSync loads all modules',
+    !!(HS.SyncQueue && HS.ConflictResolver && HS.Migration && HS.DeviceLink &&
+       HS.SyncManager && HS.CloudRepository));
+  ok('isConfigured=false without url+key',
+    HS.isConfigured({}) === false && HS.isConfigured({ url: 'x' }) === false &&
+    HS.isConfigured({ anonKey: 'k' }) === false);
+  ok('isConfigured=true only with url+anonKey',
+    HS.isConfigured({ url: 'https://x.supabase.co', anonKey: 'k' }) === true);
+  ok('app-level syncConfigured() is false with no creds', AppI.syncConfigured() === false);
+  // With sync dormant, a local mutation must NOT enqueue anything anywhere.
+  var qKeysBefore = Object.keys(_store).filter(function (k) { return k.indexOf('pantry.sync.queue') === 0; });
+  await DB.create({ name: 'Dormancy Probe', quantity: 1, categoryId: 'dry' });
+  var qKeysAfter = Object.keys(_store).filter(function (k) { return k.indexOf('pantry.sync.queue') === 0; });
+  ok('dormant: local mutation enqueues nothing', qKeysBefore.length === 0 && qKeysAfter.length === 0);
+
+  console.log('\n[sync: identity is the UUID, never the name]');
+  ok('same cloudUserId => same identity',
+    HS.isSameIdentity({ cloudUserId: 'u1', name: 'Bob' }, { cloudUserId: 'u1', name: 'Alice' }) === true);
+  ok('same NAME + different UUID => NOT merged',
+    HS.isSameIdentity({ cloudUserId: 'u1', name: 'Bob' }, { cloudUserId: 'u2', name: 'Bob' }) === false);
+  ok('no cloudUserId => not an identity',
+    HS.isSameIdentity({ name: 'Bob' }, { name: 'Bob' }) === false);
+
+  console.log('\n[sync: SyncQueue enqueue/flush/offline-persistence]');
+  var mem = {};
+  var stor = {
+    getItem: function (k) { return k in mem ? mem[k] : null; },
+    setItem: function (k, v) { mem[k] = String(v); },
+  };
+  var q = new HS.SyncQueue(stor, 'q');
+  q.enqueue({ table: 'inventory_items', opType: 'upsert', recordId: 'a', payload: { v: 1 } });
+  q.enqueue({ table: 'inventory_items', opType: 'upsert', recordId: 'b', payload: { v: 1 } });
+  q.enqueue({ table: 'inventory_items', opType: 'upsert', recordId: 'a', payload: { v: 2 } });
+  ok('coalesces repeated writes to same record (size 2)', q.size() === 2);
+  ok('coalesced op carries latest payload', q.peekAll()[0].payload.v === 2);
+  ok('preserves FIFO order (a before b)', q.peekAll()[0].recordId === 'a' && q.peekAll()[1].recordId === 'b');
+  var q2 = new HS.SyncQueue(stor, 'q'); // simulate reload from same storage
+  ok('queue persists across reloads', q2.size() === 2);
+  var sent = [];
+  var partial = await q2.flush(function (op) {
+    if (sent.length >= 1) return Promise.reject(new Error('offline'));
+    sent.push(op.recordId);
+    return Promise.resolve();
+  });
+  ok('flush stops on first failure (offline-safe)', sent.length === 1 && partial.length === 1);
+  ok('failed + later ops kept in FIFO order', q2.size() === 1 && q2.peekAll()[0].recordId === 'b');
+  var sent2 = [];
+  await q2.flush(function (op) { sent2.push(op.recordId); return Promise.resolve(); });
+  ok('reconnect flush drains queue in order', sent2.join(',') === 'b' && q2.size() === 0);
+
+  console.log('\n[sync: ConflictResolver rules]');
+  var CR = HS.ConflictResolver;
+  ok('last-write-wins by updatedAt',
+    CR.resolveRecord({ id: 1, updatedAt: '2026-01-01' }, { id: 1, updatedAt: '2026-02-01' }).updatedAt === '2026-02-01');
+  ok('resolveRecord tolerates a missing side', CR.resolveRecord(null, { id: 1 }).id === 1);
+  var merged = CR.mergeById(
+    [{ id: 'a', updatedAt: '2026-01-01', q: 1 }, { id: 'b', updatedAt: '2026-01-01' }],
+    [{ id: 'a', updatedAt: '2026-03-01', q: 9 }]
+  );
+  ok('mergeById merges by stable id (2 records)', merged.length === 2);
+  ok('mergeById keeps the newer version', merged.filter(function (r) { return r.id === 'a'; })[0].q === 9);
+  var dd = CR.dedupeProducts([
+    { barcode: '111', updatedAt: '2026-01-01', n: 'old' },
+    { barcode: '111', updatedAt: '2026-02-01', n: 'new' },
+    { barcode: '222' },
+  ]);
+  ok('dedupeProducts collapses by barcode (2 unique)', dd.length === 2);
+  ok('dedupeProducts keeps newest per barcode', dd.filter(function (p) { return p.barcode === '111'; })[0].n === 'new');
+  ok('product identity dedups by normalized name when no barcode',
+    CR.productKey({ name: '  Whole  Milk ' }) === CR.productKey({ name: 'whole milk' }));
+  ok('no quantity conflict when only one side changed',
+    CR.isQuantityConflict(5, 5, 8) === false && CR.isQuantityConflict(5, 8, 5) === false);
+  ok('quantity conflict when both changed differently', CR.isQuantityConflict(5, 8, 10) === true);
+  ok('quantity outcome: keep this device', CR.resolveQuantity('local', 8, 10) === 8);
+  ok('quantity outcome: keep cloud', CR.resolveQuantity('cloud', 8, 10) === 10);
+  ok('quantity outcome: add together', CR.resolveQuantity('add', 8, 10) === 18);
+  ok('quantity outcome: manual value', CR.resolveQuantity('manual', 8, 10, 3) === 3);
+
+  console.log('\n[sync: migration idempotency + safety]');
+  var M = HS.Migration;
+  var localData = [{ id: 'x1', quantity: 2 }, { id: 'x2', quantity: 5 }, { id: 'x1', quantity: 2 }];
+  var s0 = M.emptyState();
+  var plan1 = M.planUploads(localData, s0);
+  ok('plans each unique id once (no duplicates)', plan1.length === 2);
+  ok('preserves quantities in the upload plan', plan1.filter(function (r) { return r.id === 'x2'; })[0].quantity === 5);
+  var s1 = M.markUploaded(s0, plan1.map(function (r) { return r.id; }));
+  ok('idempotent: re-run plans nothing after confirmation', M.planUploads(localData, s1).length === 0);
+  ok('reports complete once all uploaded', M.isComplete(localData, s1) === true);
+  ok('never deletes/mutates local data (input intact)', localData.length === 3);
+
+  console.log('\n[sync: device-link tokens are crypto-random + regenerable]');
+  var tA = HS.DeviceLink.generateToken();
+  var tB = HS.DeviceLink.generateToken();
+  ok('token is a URL-safe high-entropy string', /^[A-Za-z0-9_-]{20,}$/.test(tA));
+  ok('token is regenerable (two differ)', tA !== tB);
+  var linkUrl = HS.DeviceLink.buildLinkUrl('https://app.example/#x', tA);
+  ok('link URL round-trips the token', HS.DeviceLink.parseLinkUrl(linkUrl) === tA);
+
+  console.log('\n[sync: local<->cloud record mapping]');
+  ok('cloudTableFor maps inventory + barcode tables',
+    AppI.cloudTableFor('inventoryItems') === 'inventory_items' &&
+    AppI.cloudTableFor('barcodeMappings') === 'barcode_mappings');
+  var cloudRow = AppI.mapItemToCloud(
+    { id: 'z1', name: 'Tea', nameEn: 'Tea', nameHe: '\u05EA\u05D4', quantity: 3, barcode: '999', updatedAt: '2026-05-01' },
+    'household-uuid'
+  );
+  ok('mapItemToCloud carries stable id + user_id + quantity',
+    cloudRow.id === 'z1' && cloudRow.user_id === 'household-uuid' && cloudRow.quantity === 3);
+  ok('mapItemToCloud keeps bilingual names + full data blob',
+    cloudRow.name_he === '\u05EA\u05D4' && cloudRow.data && cloudRow.data.name === 'Tea');
+
   console.log('\n============================');
   console.log('PASS ' + pass + '  FAIL ' + fail);
   console.log('============================');

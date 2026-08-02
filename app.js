@@ -814,6 +814,22 @@
       },
       '⚙️'
     );
+    // Subtle sync-status indicator. Only present when a backend is configured —
+    // otherwise sync is fully dormant and nothing is shown.
+    var syncBtn = syncConfigured()
+      ? h(
+          'button',
+          {
+            class: 'icon-btn sync-indicator',
+            id: 'sync-indicator',
+            'aria-label': t('sync.a11y'),
+            title: t('sync.title'),
+            onclick: openSyncSettings,
+          },
+          syncStatusGlyph(syncMgr ? syncMgr.status : 'idle')
+        )
+      : null;
+
     // Header avatar is now a pure ONE-TAP entry to the Switch User screen.
     var profileBtn = h(
       'button',
@@ -838,7 +854,7 @@
       h(
         'div',
         { class: 'header-actions' },
-        h('div', { class: 'header-btn-row' }, monthlyBtn, langBtn, settingsBtn, profileBtn),
+        h('div', { class: 'header-btn-row' }, monthlyBtn, langBtn, syncBtn, settingsBtn, profileBtn),
         h('span', { class: 'version', id: 'version', text: window.APP_VERSION || '' })
       )
     );
@@ -2985,6 +3001,449 @@
   // Home for account + app management: edit profile, Switch User, Manage Users
   // (the only place for create/edit/delete), language, and sign-out. Keeping
   // these here frees the header avatar to be a pure one-tap Switch User entry.
+  // ============================ Cross-device sync ============================
+  // DORMANT by default. Nothing here touches the network unless the app has a
+  // Supabase URL + anon key AND this profile is linked to a cloud identity.
+  var SYNC_URL_KEY = 'pantry.sync.url';
+  var SYNC_ANON_KEY = 'pantry.sync.anonKey';
+  var syncMgr = null; // HomeSync.SyncManager instance (when active)
+  var homeSyncPromise = null; // lazy-load promise for sync/homesync.js
+  var suppressSyncHook = false; // guard so remote-applied writes don't re-queue
+
+  // Effective config: Settings (localStorage) overrides config.js. Pure read.
+  function syncGetConfig() {
+    var url = '';
+    var anon = '';
+    try {
+      url = localStorage.getItem(SYNC_URL_KEY) || '';
+      anon = localStorage.getItem(SYNC_ANON_KEY) || '';
+    } catch (e) {}
+    var c = window.HOMESTOCK_CONFIG || {};
+    if (!url) url = c.SUPABASE_URL || '';
+    if (!anon) anon = c.SUPABASE_ANON_KEY || '';
+    return { url: String(url).trim(), anonKey: String(anon).trim() };
+  }
+  function syncConfigured() {
+    var c = syncGetConfig();
+    return !!(c.url && c.anonKey);
+  }
+  // Per-profile link state (cloud identity + anonymous session + device id).
+  function syncStateKey() {
+    var id = window.CurrentUser && window.CurrentUser.id() ? window.CurrentUser.id() : 'anon';
+    return 'pantry.sync.state.' + id;
+  }
+  function syncLoadState() {
+    try {
+      return JSON.parse(localStorage.getItem(syncStateKey()) || 'null') || {};
+    } catch (e) {
+      return {};
+    }
+  }
+  function syncSaveState(s) {
+    try {
+      localStorage.setItem(syncStateKey(), JSON.stringify(s || {}));
+    } catch (e) {}
+  }
+  function syncLinked() {
+    var s = syncLoadState();
+    return !!(s && s.cloudUserId && s.session);
+  }
+
+  function loadHomeSync() {
+    if (typeof window.HomeSync !== 'undefined' && window.HomeSync) {
+      return Promise.resolve(window.HomeSync);
+    }
+    if (homeSyncPromise) return homeSyncPromise;
+    homeSyncPromise = new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = './sync/homesync.js';
+      s.async = true;
+      s.onload = function () {
+        if (window.HomeSync) resolve(window.HomeSync);
+        else {
+          homeSyncPromise = null;
+          reject(new Error('HomeSync unavailable after load'));
+        }
+      };
+      s.onerror = function () {
+        homeSyncPromise = null;
+        reject(new Error('Failed to load sync layer'));
+      };
+      document.head.appendChild(s);
+    });
+    return homeSyncPromise;
+  }
+
+  // ---- local <-> cloud record mapping ----
+  function cloudTableFor(localTable) {
+    if (localTable === 'inventoryItems') return 'inventory_items';
+    if (localTable === 'barcodeMappings') return 'barcode_mappings';
+    return localTable;
+  }
+  function mapItemToCloud(rec, uid) {
+    return {
+      id: rec.id,
+      user_id: uid,
+      product_id: rec.productId || null,
+      barcode: rec.barcode || null,
+      name: rec.name || null,
+      name_en: rec.nameEn || null,
+      name_he: rec.nameHe || null,
+      quantity: typeof rec.quantity === 'number' ? rec.quantity : null,
+      image_hash: rec.imageHash || null,
+      data: rec,
+      updated_at: rec.updatedAt || new Date().toISOString(),
+    };
+  }
+  function mapBarcodeToCloud(rec, uid) {
+    return {
+      id: String(rec.barcode),
+      user_id: uid,
+      barcode: String(rec.barcode),
+      product_id: rec.productId || null,
+      data: rec,
+      updated_at: rec.updatedAt || new Date().toISOString(),
+    };
+  }
+  function cloudRowToItem(row) {
+    var d = (row && row.data) || {};
+    d.id = row.id;
+    if (row.updated_at) d.updatedAt = row.updated_at;
+    if (typeof row.quantity === 'number') d.quantity = row.quantity;
+    return d;
+  }
+
+  // Boot sync ONLY if configured + linked. Safe to call anytime; no-ops when
+  // dormant. Registers the DB mutation hook and starts the SyncManager.
+  function syncBoot() {
+    if (syncMgr) return; // already running
+    if (!syncConfigured() || !syncLinked()) return; // dormant
+    loadHomeSync()
+      .then(function (HS) {
+        var cfg = syncGetConfig();
+        var st = syncLoadState();
+        var repo = new HS.CloudRepository(cfg, st.session);
+        var queue = new HS.SyncQueue(localStorage, 'pantry.sync.queue.' + st.cloudUserId);
+        syncMgr = new HS.SyncManager({
+          cfg: cfg,
+          repo: repo,
+          queue: queue,
+          storage: localStorage,
+          getUserId: function () { return st.cloudUserId; },
+          onStatus: function (s) { updateSyncIndicator(s); },
+        });
+        syncMgr.onPull = function () { return syncPull(HS, repo, st); };
+        // Capture local mutations -> queue + debounced push (unless we are the
+        // ones applying a remote change).
+        window.PantryDB.onMutation(function (m) {
+          if (!syncMgr || suppressSyncHook) return;
+          var payload =
+            m.table === 'inventoryItems'
+              ? mapItemToCloud(m.record, st.cloudUserId)
+              : m.table === 'barcodeMappings'
+              ? mapBarcodeToCloud(m.record, st.cloudUserId)
+              : Object.assign({}, m.record, { user_id: st.cloudUserId });
+          var recordId = m.record && (m.record.id || m.record.barcode);
+          syncMgr.notifyLocalMutation({
+            table: cloudTableFor(m.table),
+            opType: m.opType,
+            recordId: recordId,
+            payload: payload,
+          });
+        });
+        syncMgr.start();
+        updateSyncIndicator(syncMgr.status);
+      })
+      .catch(function () {
+        /* stay offline-first; sync just stays dormant */
+      });
+  }
+
+  // Pull remote inventory deltas and merge (last-write-wins) into local IDB.
+  // Remote-applied writes are guarded so they don't re-enter the sync queue.
+  function syncPull(HS, repo, st) {
+    var since = null;
+    try { since = localStorage.getItem('pantry.sync.lastAt'); } catch (e) {}
+    return repo.selectSince('inventory_items', st.cloudUserId, since).then(function (rows) {
+      if (!rows || !rows.length) return null;
+      return window.PantryDB.getAll().then(function (localItems) {
+        var localById = {};
+        localItems.forEach(function (x) { localById[x.id] = x; });
+        var chain = Promise.resolve();
+        rows.map(cloudRowToItem).forEach(function (r) {
+          var winner = HS.ConflictResolver.resolveRecord(localById[r.id], r);
+          if (winner === r) {
+            chain = chain.then(function () {
+              suppressSyncHook = true;
+              return window.PantryDB.put(r).then(
+                function () { suppressSyncHook = false; },
+                function () { suppressSyncHook = false; }
+              );
+            });
+          }
+        });
+        return chain.then(function () { recomputeShortfall(); renderMain(); });
+      });
+    });
+  }
+
+  // First device: anonymous sign-in, create household, migrate local data up.
+  function syncEnableFirstDevice() {
+    return loadHomeSync().then(function (HS) {
+      var cfg = syncGetConfig();
+      var repo = new HS.CloudRepository(cfg);
+      return repo.signInAnonymously().then(function () {
+        return repo.createHousehold().then(function (hid) {
+          var st = {
+            cloudUserId: hid,
+            session: repo.session,
+            deviceId: HS.DeviceLink.generateToken(8),
+          };
+          syncSaveState(st);
+          return syncMigrateLocal(HS, repo, st).then(function () {
+            syncBoot();
+            return st;
+          });
+        });
+      });
+    });
+  }
+
+  // Other devices: anonymous sign-in, redeem a link code to join the household.
+  function syncLinkThisDevice(code) {
+    return loadHomeSync().then(function (HS) {
+      var cfg = syncGetConfig();
+      var repo = new HS.CloudRepository(cfg);
+      return repo.signInAnonymously().then(function () {
+        return repo.redeemLinkToken(String(code).trim()).then(function (hid) {
+          var st = {
+            cloudUserId: hid,
+            session: repo.session,
+            deviceId: HS.DeviceLink.generateToken(8),
+          };
+          syncSaveState(st);
+          syncBoot();
+          return st;
+        });
+      });
+    });
+  }
+
+  // Existing member: mint a fresh crypto-random link token for another device.
+  function syncCreateLinkCode() {
+    return loadHomeSync().then(function (HS) {
+      var st = syncLoadState();
+      var repo = new HS.CloudRepository(syncGetConfig(), st.session);
+      var token = HS.DeviceLink.generateToken();
+      return repo.createLinkToken(token, 60).then(function () { return token; });
+    });
+  }
+
+  // Idempotent local -> cloud upload. Never deletes local data.
+  function syncMigrationStateKey() {
+    var s = syncLoadState();
+    return 'pantry.sync.migration.' + (s.cloudUserId || 'none');
+  }
+  function syncMigrateLocal(HS, repo, st) {
+    var key = 'pantry.sync.migration.' + st.cloudUserId;
+    var state;
+    try { state = JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) {}
+    state = state || HS.Migration.emptyState();
+    return window.PantryDB.getAll().then(function (items) {
+      var plan = HS.Migration.planUploads(items, state);
+      if (!plan.length) return null;
+      var rows = plan.map(function (r) { return mapItemToCloud(r, st.cloudUserId); });
+      return repo.upsert('inventory_items', rows).then(function () {
+        var next = HS.Migration.markUploaded(
+          state,
+          plan.map(function (r) { return r.id; })
+        );
+        try { localStorage.setItem(key, JSON.stringify(next)); } catch (e) {}
+      });
+    });
+  }
+
+  function syncDisconnect() {
+    if (syncMgr && syncMgr.stop) syncMgr.stop();
+    syncMgr = null;
+    window.PantryDB.onMutation(null);
+    try {
+      localStorage.removeItem(syncStateKey());
+    } catch (e) {}
+  }
+
+  // Subtle header status indicator (only present when sync is configured).
+  function syncStatusGlyph(status) {
+    switch (status) {
+      case 'syncing': return '🔄';
+      case 'offline': return '📴';
+      case 'conflict': return '⚠️';
+      case 'error': return '⚠️';
+      default: return '☁️'; // idle / synced
+    }
+  }
+  function updateSyncIndicator(status) {
+    var el = document.getElementById('sync-indicator');
+    if (!el) return;
+    el.textContent = syncStatusGlyph(status);
+    var label = t('sync.status.' + (status || 'idle')) || t('sync.title');
+    el.setAttribute('title', label);
+    el.setAttribute('aria-label', t('sync.a11y') + ': ' + label);
+  }
+
+  function openSyncSettings() {
+    var overlay = h('div', { class: 'overlay center' });
+    var prevReopen = reopenTop;
+    var myReopen = function () { openSyncSettings(); };
+    reopenTop = myReopen;
+    function close() {
+      overlay.remove();
+      if (reopenTop === myReopen) reopenTop = prevReopen;
+    }
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+
+    var body = h('div', { class: 'sync-body' });
+
+    function note(msg, cls) {
+      return h('p', { class: 'sync-note ' + (cls || ''), dir: 'auto', text: msg });
+    }
+    function btn(label, cls, onClick) {
+      return h('button', { class: 'btn ' + (cls || 'ghost'), type: 'button', onclick: onClick }, label);
+    }
+
+    function rebuild() {
+      body.innerHTML = '';
+      var configured = syncConfigured();
+      var linked = syncLinked();
+
+      if (!configured) {
+        body.appendChild(note(t('sync.dormantNote')));
+      }
+
+      // Status + last sync (when linked).
+      if (linked) {
+        var status = syncMgr ? syncMgr.status : 'idle';
+        var lastAt = null;
+        try { lastAt = localStorage.getItem('pantry.sync.lastAt'); } catch (e) {}
+        body.appendChild(
+          h('div', { class: 'sync-status-row' },
+            h('span', { class: 'sync-status-glyph', text: syncStatusGlyph(status) }),
+            h('span', { class: 'sync-status-text', text: t('sync.status.' + status) })
+          )
+        );
+        body.appendChild(
+          h('p', { class: 'sync-note', text: t('sync.lastSync') + ': ' + (lastAt ? new Date(lastAt).toLocaleString() : t('sync.never')) })
+        );
+        body.appendChild(btn(t('sync.syncNow'), 'save', function () {
+          if (syncMgr) syncMgr.scheduleSync(0);
+        }));
+
+        // Link another device -> reveal code + URL.
+        var linkArea = h('div', { class: 'sync-link-area' });
+        body.appendChild(btn(t('sync.linkAnother'), 'ghost', function () {
+          linkArea.innerHTML = '';
+          linkArea.appendChild(note('…'));
+          syncCreateLinkCode().then(function (token) {
+            linkArea.innerHTML = '';
+            var url = window.HomeSync
+              ? window.HomeSync.DeviceLink.buildLinkUrl(location.origin + location.pathname, token)
+              : token;
+            var codeField = h('input', { class: 'input mono', type: 'text', readonly: 'readonly', value: token, dir: 'ltr' });
+            var urlField = h('input', { class: 'input mono', type: 'text', readonly: 'readonly', value: url, dir: 'ltr' });
+            linkArea.appendChild(h('label', { class: 'field-label', text: t('sync.linkCode') }));
+            linkArea.appendChild(codeField);
+            linkArea.appendChild(btn(t('sync.copy'), 'ghost', function () {
+              try { navigator.clipboard.writeText(token); } catch (e) {}
+            }));
+            linkArea.appendChild(h('label', { class: 'field-label', text: t('sync.linkUrl') }));
+            linkArea.appendChild(urlField);
+          }).catch(function () {
+            linkArea.innerHTML = '';
+            linkArea.appendChild(note(t('sync.errGeneric'), 'sync-error'));
+          });
+        }));
+        body.appendChild(linkArea);
+
+        body.appendChild(btn(t('sync.regenerate'), 'ghost', function () {
+          var st = syncLoadState();
+          loadHomeSync().then(function (HS) {
+            var repo = new HS.CloudRepository(syncGetConfig(), st.session);
+            return repo.revokeLinkTokens();
+          }).then(function () {
+            showToast(t('sync.regenerated'));
+          }).catch(function () { showToast(t('sync.errGeneric')); });
+        }));
+
+        body.appendChild(btn(t('sync.disconnect'), 'danger', function () {
+          if (window.confirm(t('sync.disconnectConfirm'))) {
+            syncDisconnect();
+            showToast(t('sync.disconnected'));
+            close();
+            renderMain();
+          }
+        }));
+      } else if (configured) {
+        // Configured but not yet linked on this profile.
+        body.appendChild(btn(t('sync.enable'), 'save', function () {
+          body.appendChild(note(t('sync.enabling')));
+          syncEnableFirstDevice().then(function () {
+            close();
+            renderMain();
+            openSyncSettings();
+          }).catch(function () {
+            body.appendChild(note(t('sync.errGeneric'), 'sync-error'));
+          });
+        }));
+
+        var codeInput = h('input', { class: 'input', type: 'text', placeholder: t('sync.codePlaceholder'), dir: 'ltr' });
+        body.appendChild(h('label', { class: 'field-label', text: t('sync.enterCode') }));
+        body.appendChild(codeInput);
+        body.appendChild(btn(t('sync.linkThisDevice'), 'ghost', function () {
+          var code = codeInput.value.trim();
+          if (!code) return;
+          syncLinkThisDevice(code).then(function () {
+            close();
+            renderMain();
+            openSyncSettings();
+          }).catch(function () {
+            body.appendChild(note(t('sync.errLink'), 'sync-error'));
+          });
+        }));
+      }
+
+      // Backend settings (URL + anon key) — always available.
+      var cfg = syncGetConfig();
+      var urlInput = h('input', { class: 'input', type: 'url', value: cfg.url, placeholder: 'https://xxxx.supabase.co', dir: 'ltr' });
+      var anonInput = h('input', { class: 'input mono', type: 'text', value: cfg.anonKey, placeholder: 'eyJhbGci…', dir: 'ltr' });
+      body.appendChild(h('h3', { class: 'sync-subhead', text: t('sync.backendSettings') }));
+      body.appendChild(h('label', { class: 'field-label', text: t('sync.supabaseUrl') }));
+      body.appendChild(urlInput);
+      body.appendChild(h('label', { class: 'field-label', text: t('sync.anonKey') }));
+      body.appendChild(anonInput);
+      body.appendChild(h('p', { class: 'sync-note', text: t('sync.anonKeyHint') }));
+      body.appendChild(btn(t('sync.save'), 'save', function () {
+        try {
+          localStorage.setItem(SYNC_URL_KEY, urlInput.value.trim());
+          localStorage.setItem(SYNC_ANON_KEY, anonInput.value.trim());
+        } catch (e) {}
+        showToast(t('sync.saved'));
+        rebuild();
+      }));
+    }
+
+    var dialog = h('div', { class: 'dialog settings-dialog' },
+      h('div', { class: 'sheet-header' },
+        h('h2', { class: 'dialog-title', text: t('sync.title') }),
+        h('button', { class: 'sheet-close', 'aria-label': t('a11y.close'), onclick: close }, '✕')
+      ),
+      h('p', { class: 'sync-subtitle', text: t('sync.subtitle') }),
+      body
+    );
+    rebuild();
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+  }
+
   function openSettings() {
     var cu = window.CurrentUser;
     var overlay = h('div', { class: 'overlay center' });
@@ -3030,6 +3489,7 @@
       row(t('settings.editProfile'), null, function () { close(); openProfile(); }),
       row(t('auth.switchUser'), t('auth.switchUserSub'), function () { close(); renderSwitchUser(); }),
       row(t('auth.manageUsers'), t('auth.manageUsersSub'), function () { close(); renderManageUsers(); }),
+      row(t('settings.sync'), t('settings.syncSub'), function () { close(); openSyncSettings(); }),
       h('label', { class: 'field-label', text: t('auth.preferredLanguage') }),
       langBox,
       h('button', { class: 'btn ghost', type: 'button', onclick: function () { close(); chooseAnother(); } }, t('auth.chooseAnother')),
@@ -3057,6 +3517,8 @@
       .then(function () {
         recomputeShortfall();
         renderMain();
+        // Wake cross-device sync ONLY if configured + linked (else dormant).
+        syncBoot();
       });
   }
 
@@ -3128,6 +3590,11 @@
       localName: localName,
       // THE single shared barcode lookup used by camera + manual entry.
       lookupBarcode: lookupBarcode,
+      // Sync gating (dormant-by-default) — exposed for the logic harness.
+      syncGetConfig: syncGetConfig,
+      syncConfigured: syncConfigured,
+      cloudTableFor: cloudTableFor,
+      mapItemToCloud: mapItemToCloud,
     },
   };
 })();

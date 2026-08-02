@@ -1,6 +1,6 @@
 /* Service worker: precache + cache-first, offline-capable, self-updating.
    Bump VERSION on every deploy to trigger an update for installed PWAs. */
-var VERSION = 'v1.10.0';
+var VERSION = 'v1.11.0';
 var CACHE = 'pantry-' + VERSION;
 
 // Critical-path assets for first paint + full offline. Kept lean: only what
@@ -11,6 +11,7 @@ var ASSETS = [
   './',
   './index.html',
   './styles.css',
+  './config.js',
   './i18n.js',
   './db.js',
   './auth.js',
@@ -19,6 +20,10 @@ var ASSETS = [
   // Scanner library: precached so the lazy load (on first scanner open) still
   // resolves from cache offline, but it is NOT on the startup/parse path.
   './vendor/zxing.min.js',
+  // Cross-device sync layer: precached so it resolves offline, but (like the
+  // scanner) it is lazy-loaded only when a backend is configured + linked, so
+  // it stays off the startup/parse path and the app is offline-first by default.
+  './sync/homesync.js',
   './data/foods.js',
   './manifest.webmanifest',
   './icons/icon-16.png',
