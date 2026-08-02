@@ -81,7 +81,8 @@
         missing: '{{missing}} missing (have {{have}} of {{target}})',
       },
       scan: {
-        button: 'Scan barcode',
+        button: 'Scan product',
+        fabHint: 'Scan',
         point: 'Point the camera at a product barcode',
         looking: 'Looking up product…',
         denied: 'Camera access was denied. You can add the item manually.',
@@ -89,6 +90,31 @@
         added: 'Added “{{name}}”',
         notFound: 'Product not found — enter the details',
         undo: 'Undo',
+        continuous: 'Continuous scan',
+        detected: 'Detected {{code}}',
+        foundLocal: 'Already in your pantry',
+        fromCatalog: 'From your saved products',
+        fromOff: 'Imported from Open Food Facts',
+        offline: 'Offline — using saved products only',
+        offUnreachable: "Couldn't reach the product database — enter the details",
+        sessionTitle: 'Scanned',
+        sessionEmpty: 'Scan a barcode to begin',
+        addAll: 'Add all ({{count}})',
+        committed: 'Added {{count}} products to your pantry',
+        reviewTitle: 'Review product',
+        newTitle: 'New product',
+        barcode: 'Barcode',
+        enName: 'English name',
+        heName: 'Hebrew name',
+        brand: 'Brand',
+        size: 'Package size',
+        nameRequired: 'Enter at least one name',
+        addUnitsTitle: 'Add to pantry',
+        inStock: 'In stock: {{qty}} {{unit}}',
+        howMany: 'How many to add?',
+        add: 'Add',
+        save: 'Save',
+        unknownName: 'Unknown product',
       },
       monthly: {
         button: 'Monthly restock',
@@ -106,6 +132,23 @@
         a11y: 'Change language',
         english: 'English',
         hebrew: 'עברית',
+      },
+      auth: {
+        title: 'My Pantry',
+        subtitle: 'Sign in to your pantry',
+        username: 'Username',
+        usernamePlaceholder: 'Enter your username',
+        password: 'Password',
+        passwordPlaceholder: 'Enter your password',
+        login: 'Sign in',
+        logout: 'Sign out',
+        a11y: 'Account',
+        demoHint: 'Demo: aviraz / aviraz · guest / guest',
+        welcome: 'Welcome, {{name}}',
+        loggedOut: 'Signed out',
+        errorEmpty: 'Enter a username and password',
+        errorUnknownUser: 'User not found',
+        errorWrongPassword: 'Incorrect password',
       },
     },
 
@@ -186,7 +229,8 @@
         missing: 'חסר {{missing}} (יש {{have}} מתוך {{target}})',
       },
       scan: {
-        button: 'סריקת ברקוד',
+        button: 'סריקת מוצר',
+        fabHint: 'סריקה',
         point: 'כוונו את המצלמה אל ברקוד המוצר',
         looking: 'מחפש מוצר…',
         denied: 'הגישה למצלמה נדחתה. ניתן להוסיף את הפריט באופן ידני.',
@@ -194,6 +238,31 @@
         added: 'נוסף ״{{name}}״',
         notFound: 'המוצר לא נמצא — השלימו את הפרטים',
         undo: 'ביטול',
+        continuous: 'סריקה רציפה',
+        detected: 'זוהה {{code}}',
+        foundLocal: 'כבר קיים במזווה שלך',
+        fromCatalog: 'מהמוצרים השמורים שלך',
+        fromOff: 'יובא מ-Open Food Facts',
+        offline: 'לא מקוון — שימוש במוצרים השמורים בלבד',
+        offUnreachable: 'לא ניתן להגיע למאגר המוצרים — השלימו את הפרטים',
+        sessionTitle: 'נסרקו',
+        sessionEmpty: 'סרקו ברקוד כדי להתחיל',
+        addAll: 'הוספת הכול ({{count}})',
+        committed: 'נוספו {{count}} מוצרים למזווה שלך',
+        reviewTitle: 'בדיקת מוצר',
+        newTitle: 'מוצר חדש',
+        barcode: 'ברקוד',
+        enName: 'שם באנגלית',
+        heName: 'שם בעברית',
+        brand: 'מותג',
+        size: 'גודל אריזה',
+        nameRequired: 'יש להזין שם אחד לפחות',
+        addUnitsTitle: 'הוספה למזווה',
+        inStock: 'במלאי: {{qty}} {{unit}}',
+        howMany: 'כמה להוסיף?',
+        add: 'הוספה',
+        save: 'שמירה',
+        unknownName: 'מוצר לא ידוע',
       },
       monthly: {
         button: 'מעקב חודשי',
@@ -212,11 +281,29 @@
         english: 'English',
         hebrew: 'עברית',
       },
+      auth: {
+        title: 'המזווה שלי',
+        subtitle: 'התחברו למזווה שלכם',
+        username: 'שם משתמש',
+        usernamePlaceholder: 'הזינו שם משתמש',
+        password: 'סיסמה',
+        passwordPlaceholder: 'הזינו סיסמה',
+        login: 'התחברות',
+        logout: 'התנתקות',
+        a11y: 'חשבון',
+        demoHint: 'הדגמה: aviraz / aviraz · guest / guest',
+        welcome: 'ברוך הבא, {{name}}',
+        loggedOut: 'התנתקת',
+        errorEmpty: 'הזינו שם משתמש וסיסמה',
+        errorUnknownUser: 'המשתמש לא נמצא',
+        errorWrongPassword: 'סיסמה שגויה',
+      },
     },
   };
 
   var RTL_LANGS = ['he'];
-  var STORAGE_KEY = 'pantry.lang';
+  var STORAGE_BASE = 'pantry.lang';
+  var storageKey = STORAGE_BASE; // per-user key set via setUser()
   var lang = 'en';
 
   function isRtlLang(l) {
@@ -269,7 +356,7 @@
     if (l !== 'en' && l !== 'he') return;
     lang = l;
     try {
-      localStorage.setItem(STORAGE_KEY, l);
+      localStorage.setItem(storageKey, l);
     } catch (e) {}
     applyDir();
   }
@@ -277,9 +364,22 @@
   function init() {
     var stored = null;
     try {
-      stored = localStorage.getItem(STORAGE_KEY);
+      stored = localStorage.getItem(storageKey);
     } catch (e) {}
     lang = stored === 'en' || stored === 'he' ? stored : detect();
+    applyDir();
+  }
+
+  // Namespace language settings per logged-in user (independent per user).
+  // Loads that user's stored language if any; otherwise keeps the current one.
+  // Pass null/undefined to return to the shared (pre-login) key.
+  function setUser(id) {
+    storageKey = STORAGE_BASE + (id ? '.' + id : '');
+    var stored = null;
+    try {
+      stored = localStorage.getItem(storageKey);
+    } catch (e) {}
+    if (stored === 'en' || stored === 'he') lang = stored;
     applyDir();
   }
 
@@ -287,6 +387,7 @@
     t: t,
     tc: tc,
     setLang: setLang,
+    setUser: setUser,
     getLang: function () {
       return lang;
     },

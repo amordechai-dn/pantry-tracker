@@ -212,6 +212,124 @@
     reader.readAsDataURL(file);
   }
 
+  // ---- Reusable form controls (shared by add/edit form + scanner dialogs) ----
+
+  // On-device photo control. `state` is mutated in place (state.image); the
+  // placeholder falls back to state.emoji or the category emoji.
+  function photoControl(state) {
+    var fileInput = h('input', { class: 'photo-file', type: 'file', accept: 'image/*' });
+    var row = h('div', { class: 'photo-row' });
+    function render() {
+      row.innerHTML = '';
+      var tile = state.image
+        ? h(
+            'div',
+            { class: 'photo-preview has-img' },
+            h('img', { class: 'thumb-img loaded', src: state.image, alt: '' })
+          )
+        : h(
+            'div',
+            { class: 'photo-preview' },
+            h('span', { text: state.emoji || categoryEmoji(state.categoryId) })
+          );
+      var addBtn = h(
+        'button',
+        { class: 'btn ghost', type: 'button', onclick: function () { fileInput.click(); } },
+        state.image ? t('form.changePhoto') : t('form.addPhoto')
+      );
+      var rm = state.image
+        ? h(
+            'button',
+            {
+              class: 'btn ghost danger',
+              type: 'button',
+              onclick: function () { state.image = null; render(); },
+            },
+            t('form.removePhoto')
+          )
+        : null;
+      row.appendChild(tile);
+      row.appendChild(h('div', { class: 'photo-actions' }, addBtn, rm));
+    }
+    fileInput.addEventListener('change', function () {
+      var f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      processImage(f, function (dataUrl) {
+        if (dataUrl) { state.image = dataUrl; render(); }
+        else showToast(t('form.imageError'));
+        fileInput.value = '';
+      });
+    });
+    render();
+    return { row: row, input: fileInput, render: render };
+  }
+
+  // A min-1 quantity stepper bound to get/set accessors.
+  function stepperBox(get, set) {
+    var val = h('span', { class: 'qty', text: formatQty(get()) });
+    function upd() { val.textContent = formatQty(get()); }
+    return h(
+      'div',
+      { class: 'qty-box' },
+      h(
+        'div',
+        { class: 'stepper' },
+        h('button', { class: 'step-btn', type: 'button', onclick: function () { set(Math.max(1, get() - 1)); upd(); } }, '−'),
+        h('div', { class: 'step-value' }, val),
+        h('button', { class: 'step-btn primary', type: 'button', onclick: function () { set(get() + 1); upd(); } }, '+')
+      )
+    );
+  }
+
+  // Category selection chips bound to get/set accessors.
+  function categoryChips(get, set) {
+    var chips = h('div', { class: 'chips' });
+    CATEGORIES.forEach(function (cat) {
+      chips.appendChild(
+        h(
+          'button',
+          {
+            class: 'chip' + (get() === cat.id ? ' active' : ''),
+            type: 'button',
+            onclick: function () {
+              set(cat.id);
+              Array.prototype.forEach.call(chips.children, function (c, idx) {
+                c.className = 'chip' + (CATEGORIES[idx].id === cat.id ? ' active' : '');
+              });
+            },
+          },
+          h('span', { text: cat.emoji }),
+          h('span', { text: t('categories.' + cat.id) })
+        )
+      );
+    });
+    return chips;
+  }
+
+  // Unit selection chips bound to get/set accessors.
+  function unitChipsBox(get, set) {
+    var chips = h('div', { class: 'chips' });
+    UNITS.forEach(function (u) {
+      chips.appendChild(
+        h(
+          'button',
+          {
+            class: 'chip unit' + (get() === u ? ' active' : ''),
+            type: 'button',
+            onclick: function () {
+              set(u);
+              Array.prototype.forEach.call(chips.children, function (c, idx) {
+                c.className = 'chip unit' + (UNITS[idx] === u ? ' active' : '');
+              });
+            },
+          },
+          t('units.' + u)
+        )
+      );
+    });
+    return chips;
+  }
+
   // ---- State ----
   var items = [];
   var root;
@@ -319,6 +437,16 @@
       },
       '📅'
     );
+    var logoutBtn = h(
+      'button',
+      {
+        class: 'icon-btn',
+        'aria-label': t('auth.logout'),
+        title: t('auth.logout'),
+        onclick: doLogout,
+      },
+      '🚪'
+    );
 
     var header = h(
       'header',
@@ -332,7 +460,7 @@
       h(
         'div',
         { class: 'header-actions' },
-        h('div', { class: 'header-btn-row' }, monthlyBtn, langBtn),
+        h('div', { class: 'header-btn-row' }, monthlyBtn, langBtn, logoutBtn),
         h('span', { class: 'version', id: 'version', text: window.APP_VERSION || '' })
       )
     );
@@ -592,65 +720,12 @@
 
     // Photo — on-device image with emoji placeholder fallback.
     body.appendChild(h('label', { class: 'field-label', text: t('form.photo') }));
-    var fileInput = h('input', {
-      class: 'photo-file',
-      type: 'file',
-      accept: 'image/*',
-    });
-    var photoRow = h('div', { class: 'photo-row' });
+    var photo = photoControl(state);
     function renderPhoto() {
-      photoRow.innerHTML = '';
-      var tile = state.image
-        ? h(
-            'div',
-            { class: 'photo-preview has-img' },
-            h('img', { class: 'thumb-img loaded', src: state.image, alt: '' })
-          )
-        : h(
-            'div',
-            { class: 'photo-preview' },
-            h('span', {
-              text: state.emoji || categoryEmoji(state.categoryId),
-            })
-          );
-      var addBtn = h(
-        'button',
-        { class: 'btn ghost', type: 'button', onclick: function () { fileInput.click(); } },
-        state.image ? t('form.changePhoto') : t('form.addPhoto')
-      );
-      var removeBtn = state.image
-        ? h(
-            'button',
-            {
-              class: 'btn ghost danger',
-              type: 'button',
-              onclick: function () {
-                state.image = null;
-                renderPhoto();
-              },
-            },
-            t('form.removePhoto')
-          )
-        : null;
-      photoRow.appendChild(tile);
-      photoRow.appendChild(h('div', { class: 'photo-actions' }, addBtn, removeBtn));
+      photo.render();
     }
-    fileInput.addEventListener('change', function () {
-      var file = fileInput.files && fileInput.files[0];
-      if (!file) return;
-      processImage(file, function (dataUrl) {
-        if (dataUrl) {
-          state.image = dataUrl;
-          renderPhoto();
-        } else {
-          showToast(t('form.imageError'));
-        }
-        fileInput.value = '';
-      });
-    });
-    renderPhoto();
-    body.appendChild(photoRow);
-    body.appendChild(fileInput);
+    body.appendChild(photo.row);
+    body.appendChild(photo.input);
 
     // Name + autocomplete
     var nameInput = h('input', {
@@ -1083,7 +1158,7 @@
   }
 
   // ---- Language modal ----
-  function openLang() {
+  function openLang(rerender) {
     var overlay = h('div', { class: 'overlay center' });
     function close() {
       overlay.remove();
@@ -1102,7 +1177,7 @@
           onclick: function () {
             if (window.I18N.getLang() !== code) {
               window.I18N.setLang(code);
-              renderMain();
+              (rerender || renderMain)();
             }
             close();
           },
@@ -1276,7 +1351,114 @@
     timer = setTimeout(dismiss, 6000);
   }
 
-  // ---- Barcode scanner ----
+  // ================= Smart barcode scanner =================
+
+  // Find an existing inventory item that already carries this barcode.
+  function itemByBarcode(code) {
+    code = String(code || '');
+    for (var i = 0; i < items.length; i++)
+      if (items[i].barcode && String(items[i].barcode) === code) return items[i];
+    return null;
+  }
+
+  // Success feedback: short vibration + a soft WebAudio beep (no asset needed).
+  var audioCtx = null;
+  function scanFeedback() {
+    try {
+      if (navigator.vibrate) navigator.vibrate(60);
+    } catch (e) {}
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      if (!audioCtx) audioCtx = new AC();
+      var o = audioCtx.createOscillator();
+      var g = audioCtx.createGain();
+      o.type = 'sine';
+      o.frequency.value = 880;
+      g.gain.value = 0.05;
+      o.connect(g);
+      g.connect(audioCtx.destination);
+      o.start();
+      setTimeout(function () { try { o.stop(); } catch (e) {} }, 110);
+    } catch (e) {}
+  }
+
+  // Fetch + compress a remote (Open Food Facts) image to a local data URL so it
+  // works offline afterwards. Resolves null on any failure (never a broken img).
+  function fetchImageLocal(url) {
+    return new Promise(function (resolve) {
+      if (!url) return resolve(null);
+      try {
+        fetch(url)
+          .then(function (r) { return r.ok ? r.blob() : null; })
+          .then(function (blob) {
+            if (!blob) return resolve(null);
+            // processImage accepts any Blob; the data URL is same-origin so the
+            // canvas is not tainted and export succeeds.
+            processImage(blob, function (dataUrl) { resolve(dataUrl || null); });
+          })
+          .catch(function () { resolve(null); });
+      } catch (e) {
+        resolve(null);
+      }
+    });
+  }
+
+  // Local-first lookup: an existing inventory item, then the per-user
+  // barcode->product cache/mapping. Resolves null when nothing local matches.
+  function resolveLocal(code) {
+    var item = itemByBarcode(code);
+    if (item) return Promise.resolve({ source: 'inventory', item: item });
+    return window.PantryDB.getBarcode(code).then(function (rec) {
+      return rec ? { source: 'cache', product: rec } : null;
+    });
+  }
+
+  // External Open Food Facts lookup. Returns a product object (source 'off'),
+  // { offline:true }, { error:true }, or null (found nothing usable).
+  function lookupOFF(code) {
+    if (!navigator.onLine) return Promise.resolve({ offline: true });
+    var url =
+      'https://world.openfoodfacts.org/api/v2/product/' +
+      encodeURIComponent(code) +
+      '.json?fields=product_name,product_name_en,product_name_he,generic_name,' +
+      'brands,categories_tags,image_front_small_url,image_small_url,image_front_url,quantity';
+    return fetch(url)
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var p = d && d.product;
+        if (!p || d.status !== 1) return null;
+        var name = p.product_name_en || p.product_name || p.generic_name || '';
+        var he = p.product_name_he || '';
+        if (!name.trim() && !he.trim()) return null;
+        var cat = deriveCategory(p.categories_tags);
+        var fm = foodMatch(name || he);
+        if (fm && cat === 'other' && fm.category) cat = fm.category;
+        var imgUrl =
+          p.image_front_small_url || p.image_small_url || p.image_front_url || '';
+        return fetchImageLocal(imgUrl).then(function (img) {
+          return {
+            barcode: String(code),
+            name: name.trim(),
+            he: he.trim(),
+            brand: (p.brands || '').split(',')[0].trim() || '',
+            size: (p.quantity || '').trim(),
+            categoryId: cat,
+            unit: fm && fm.unit ? fm.unit : 'pcs',
+            emoji: fm ? fm.emoji : null,
+            image: img,
+            source: 'off',
+          };
+        });
+      })
+      .catch(function () { return { error: true }; });
+  }
+
+  function scanDisplayName(p) {
+    if (window.I18N.getLang() === 'he') return p.he || p.name || t('scan.unknownName');
+    return p.name || p.he || t('scan.unknownName');
+  }
+
   function openScanner() {
     // No camera / library support → straight to manual entry.
     if (
@@ -1288,158 +1470,552 @@
       return;
     }
 
+    var continuous = false;
+    var session = []; // grouped entries: {barcode,name,he,image,emoji,categoryId,unit,count,itemId,source}
+    var byKey = {};
+    var busy = false; // gate reads while a single-scan dialog is open
+    var lastCode = null;
+    var lastTime = 0;
+    var closed = false;
+    var reader = new ZXing.BrowserMultiFormatReader();
+    var controls = null;
+
     var overlay = h('div', { class: 'overlay scanner center' });
     var video = h('video', { class: 'scan-video' });
     video.setAttribute('playsinline', 'true');
     video.setAttribute('muted', 'true');
     video.setAttribute('autoplay', 'true');
-
+    var frame = h('div', { class: 'scan-frame' }, video, h('div', { class: 'scan-reticle' }));
     var status = h('div', { class: 'scan-status', text: t('scan.point') });
-    var reader = new ZXing.BrowserMultiFormatReader();
-    var controls = null;
-    var done = false;
-    var lastCode = null;
-    var lastTime = 0;
 
-    function stop() {
-      try {
-        if (controls) controls.stop();
-      } catch (e) {}
-      try {
-        if (reader.reset) reader.reset();
-      } catch (e) {}
-    }
-    function close() {
-      stop();
-      overlay.remove();
-    }
+    var toggleInput = h('input', { type: 'checkbox', class: 'scan-toggle-input' });
+    toggleInput.addEventListener('change', function () {
+      continuous = toggleInput.checked;
+      renderSession();
+    });
+    var toggle = h(
+      'label',
+      { class: 'scan-toggle' },
+      toggleInput,
+      h('span', { class: 'scan-switch' }),
+      h('span', { class: 'scan-toggle-label', text: t('scan.continuous') })
+    );
 
+    var sessionBox = h('div', { class: 'scan-session' });
+    var addAllBtn = h(
+      'button',
+      { class: 'btn save', type: 'button', onclick: commitSession },
+      t('scan.addAll', { count: 0 })
+    );
     var manualBtn = h(
       'button',
       {
         class: 'btn cancel',
         type: 'button',
-        onclick: function () {
-          close();
-          openForm(null, { prefill: {} });
-        },
+        onclick: function () { close(); openForm(null, { prefill: {} }); },
       },
       t('scan.manual')
     );
     var cancelBtn = h(
       'button',
-      { class: 'btn cancel', type: 'button', onclick: close },
+      { class: 'btn cancel', type: 'button', onclick: function () { close(); } },
       t('form.cancel')
     );
 
     var panel = h(
       'div',
       { class: 'scan-panel' },
-      h('div', { class: 'scan-frame' }, video, h('div', { class: 'scan-reticle' })),
+      frame,
+      toggle,
       status,
+      sessionBox,
       h('div', { class: 'actions' }, cancelBtn, manualBtn)
     );
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
 
+    function stop() {
+      try { if (controls) controls.stop(); } catch (e) {}
+      try { if (reader.reset) reader.reset(); } catch (e) {}
+    }
+    function close() {
+      if (closed) return;
+      closed = true;
+      stop();
+      overlay.remove();
+    }
+    function flash() {
+      frame.classList.add('hit');
+      setTimeout(function () { frame.classList.remove('hit'); }, 320);
+    }
+    function hit() { flash(); scanFeedback(); }
+
+    function startDecode() {
+      reader
+        .decodeFromConstraints(
+          { video: { facingMode: { ideal: 'environment' } } },
+          video,
+          function (result) { if (result) onCode(result.getText()); }
+        )
+        .then(function (c) { controls = c; })
+        .catch(function () {
+          status.textContent = t('scan.denied');
+          status.classList.add('error');
+        });
+    }
+    function resume() {
+      if (closed) return;
+      busy = false;
+      lastCode = null;
+      status.classList.remove('error');
+      status.textContent = t('scan.point');
+      startDecode();
+    }
+
+    function renderSession() {
+      sessionBox.innerHTML = '';
+      if (!continuous) {
+        sessionBox.style.display = 'none';
+        if (addAllBtn.parentNode) addAllBtn.parentNode.removeChild(addAllBtn);
+        return;
+      }
+      sessionBox.style.display = 'block';
+      sessionBox.appendChild(h('div', { class: 'scan-session-title', text: t('scan.sessionTitle') }));
+      if (!session.length) {
+        sessionBox.appendChild(h('div', { class: 'scan-session-empty', text: t('scan.sessionEmpty') }));
+      } else {
+        var list = h('div', { class: 'scan-session-list' });
+        session.forEach(function (e) {
+          list.appendChild(
+            h(
+              'div',
+              { class: 'scan-row' },
+              itemThumb(e, 'sm'),
+              h('span', { class: 'scan-row-name', text: scanDisplayName(e) }),
+              h('span', { class: 'scan-row-count', text: '×' + e.count })
+            )
+          );
+        });
+        sessionBox.appendChild(list);
+      }
+      var total = session.reduce(function (n, e) { return n + e.count; }, 0);
+      addAllBtn.textContent = t('scan.addAll', { count: total });
+      if (session.length) {
+        if (!addAllBtn.parentNode) panel.insertBefore(addAllBtn, panel.lastChild);
+      } else if (addAllBtn.parentNode) {
+        addAllBtn.parentNode.removeChild(addAllBtn);
+      }
+    }
+
+    function addToSession(prod) {
+      var e = byKey[prod.barcode];
+      if (e) {
+        e.count += 1;
+      } else {
+        e = {
+          barcode: prod.barcode,
+          name: prod.name || '',
+          he: prod.he || '',
+          image: prod.image || null,
+          emoji: prod.emoji || null,
+          categoryId: prod.categoryId || 'other',
+          unit: prod.unit || 'pcs',
+          count: 1,
+          itemId: prod.itemId || null,
+          source: prod.source || 'user',
+        };
+        byKey[prod.barcode] = e;
+        session.push(e);
+      }
+      hit();
+      status.textContent = t('scan.detected', { code: prod.barcode });
+      renderSession();
+    }
+
+    function resolveForSession(code) {
+      resolveLocal(code).then(function (local) {
+        if (local && local.source === 'inventory') {
+          var it = local.item;
+          addToSession({
+            barcode: code, name: it.name, image: it.image, emoji: it.emoji,
+            categoryId: it.categoryId, unit: it.unit, itemId: it.id, source: 'inventory',
+          });
+          return;
+        }
+        if (local && local.source === 'cache') {
+          addToSession(local.product);
+          return;
+        }
+        status.textContent = t('scan.looking');
+        lookupOFF(code).then(function (off) {
+          if (off && off.source === 'off') {
+            window.PantryDB.putBarcode(off);
+            addToSession(off);
+          } else {
+            if (off && off.offline) status.textContent = t('scan.offline');
+            // Unknown/unreachable → placeholder entry; editable later in inventory.
+            addToSession({ barcode: code, name: '', categoryId: 'other', unit: 'pcs' });
+          }
+        });
+      });
+    }
+
+    function handleSingle(code) {
+      resolveLocal(code).then(function (local) {
+        if (local && local.source === 'inventory') {
+          hit();
+          openAddUnits(local.item, resume, closeSaved);
+          return;
+        }
+        if (local && local.source === 'cache') {
+          hit();
+          openBarcodeProduct(
+            { barcode: code, product: local.product, hint: t('scan.fromCatalog') },
+            resume, closeSaved
+          );
+          return;
+        }
+        lookupOFF(code).then(function (off) {
+          hit();
+          if (off && off.source === 'off') {
+            window.PantryDB.putBarcode(off);
+            openBarcodeProduct(
+              { barcode: code, product: off, hint: t('scan.fromOff') },
+              resume, closeSaved
+            );
+          } else {
+            showToast(off && off.offline ? t('scan.offline') : t('scan.offUnreachable'));
+            openBarcodeProduct(
+              { barcode: code, product: { barcode: code, categoryId: 'other', unit: 'pcs' }, isNew: true },
+              resume, closeSaved
+            );
+          }
+        });
+      });
+    }
+
+    // Called by single-scan dialogs on success (auto-close scanner + refresh).
+    function closeSaved() {
+      close();
+      refresh();
+    }
+
     function onCode(code) {
       var now = Date.now();
-      if (done) return;
-      if (code === lastCode && now - lastTime < 3000) return;
+      if (closed) return;
+      if (code === lastCode && now - lastTime < 2500) return; // debounce dupes
       lastCode = code;
       lastTime = now;
-      done = true;
-      stop();
-      status.textContent = t('scan.looking');
-      resolveProduct(code, {
-        close: function () {
-          overlay.remove();
-        },
-      });
+      if (continuous) {
+        resolveForSession(code);
+      } else {
+        if (busy) return;
+        busy = true;
+        stop();
+        status.textContent = t('scan.looking');
+        handleSingle(code);
+      }
     }
 
-    reader
-      .decodeFromConstraints(
-        { video: { facingMode: { ideal: 'environment' } } },
-        video,
-        function (result) {
-          if (result) onCode(result.getText());
-        }
-      )
-      .then(function (c) {
-        controls = c;
-      })
-      .catch(function () {
-        // Permission denied or no camera.
-        status.textContent = t('scan.denied');
-        status.classList.add('error');
-      });
-  }
-
-  function resolveProduct(code, ctx) {
-    function fallbackToForm(showNotFound) {
-      ctx.close();
-      if (showNotFound) showToast(t('scan.notFound'));
-      openForm(null, { prefill: { barcode: code } });
-    }
-
-    if (!navigator.onLine) {
-      fallbackToForm(false);
-      return;
-    }
-
-    var url =
-      'https://world.openfoodfacts.org/api/v2/product/' +
-      encodeURIComponent(code) +
-      '.json?fields=product_name,product_name_en,generic_name,brands,categories_tags';
-
-    fetch(url)
-      .then(function (r) {
-        return r.json();
-      })
-      .then(function (d) {
-        var p = d && d.product;
-        var name =
-          p && (p.product_name || p.product_name_en || p.generic_name);
-        if (d && d.status === 1 && name && name.trim()) {
-          var cat = deriveCategory(p.categories_tags);
-          var fm = foodMatch(name);
-          if (fm && cat === 'other' && fm.category) cat = fm.category;
-          window.PantryDB.create({
-            name: name.trim(),
-            quantity: 1,
-            unit: 'pcs',
-            categoryId: cat,
-            location: 'Pantry',
-            barcode: code,
-            emoji: fm ? fm.emoji : null,
+    function commitSession() {
+      var entries = session.slice();
+      if (!entries.length) { close(); return; }
+      var total = entries.reduce(function (n, e) { return n + e.count; }, 0);
+      var chain = Promise.resolve();
+      entries.forEach(function (e) {
+        chain = chain.then(function () {
+          var existing = e.itemId ? itemById(e.itemId) : itemByBarcode(e.barcode);
+          if (existing) {
+            existing.quantity += e.count;
+            return window.PantryDB.put(existing).then(function () { recordDelta(e.count); });
+          }
+          var nm = e.name || e.he || t('scan.unknownName');
+          return window.PantryDB.create({
+            name: nm, quantity: e.count, unit: e.unit, categoryId: e.categoryId,
+            location: 'Pantry', barcode: e.barcode, emoji: e.emoji, image: e.image || null,
           }).then(function (item) {
             recordDelta(item.quantity);
-            ctx.close();
-            refresh().then(function () {
-              showToast(t('scan.added', { name: item.name }), function () {
-                window.PantryDB.remove(item.id).then(function () {
-                  recordDelta(-item.quantity);
-                  refresh();
-                });
-              });
+            return window.PantryDB.putBarcode({
+              barcode: e.barcode, name: e.name || '', he: e.he || '',
+              categoryId: e.categoryId, unit: e.unit, image: e.image || null,
+              emoji: e.emoji || null, source: e.source || 'user',
             });
           });
-        } else {
-          fallbackToForm(true);
-        }
-      })
-      .catch(function () {
-        fallbackToForm(false);
+        });
       });
+      chain.then(function () {
+        close();
+        refresh().then(function () { showToast(t('scan.committed', { count: total })); });
+      });
+    }
+
+    renderSession();
+    startDecode();
   }
 
-  // ---- Boot ----
-  function start() {
-    window.I18N.init();
-    load().then(function () {
+  // Known product already in inventory: choose how many units to add, then
+  // increment the existing item (no duplicate). onCancel/onSaved handle flow.
+  function openAddUnits(item, onCancel, onSaved) {
+    var qty = 1;
+    var overlay = h('div', { class: 'overlay center' });
+    function close(saved) {
+      overlay.remove();
+      if (saved) { if (onSaved) onSaved(); }
+      else if (onCancel) onCancel();
+    }
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(false); });
+
+    var dialog = h(
+      'div',
+      { class: 'dialog' },
+      h('div', { class: 'sheet-header' },
+        h('h2', { class: 'dialog-title', text: t('scan.addUnitsTitle') }),
+        h('button', { class: 'sheet-close', 'aria-label': 'X', onclick: function () { close(false); } }, '✕')
+      ),
+      h('div', { class: 'scan-hero' },
+        itemThumb(item),
+        h('div', { class: 'scan-hero-info' },
+          h('div', { class: 'scan-hero-name', text: item.name }),
+          h('div', { class: 'scan-hero-sub', text: t('scan.inStock', { qty: formatQty(item.quantity), unit: t('units.' + item.unit) }) })
+        )
+      ),
+      h('label', { class: 'field-label', text: t('scan.howMany') }),
+      stepperBox(function () { return qty; }, function (v) { qty = v; }),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn cancel', type: 'button', onclick: function () { close(false); } }, t('form.cancel')),
+        h('button', {
+          class: 'btn save', type: 'button',
+          onclick: function () {
+            item.quantity += qty;
+            window.PantryDB.put(item).then(function () {
+              recordDelta(qty);
+              close(true);
+            });
+          },
+        }, t('scan.add'))
+      )
+    );
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+  }
+
+  // Review (OFF import / cached) or create-new (unknown) product dialog. Saves
+  // an inventory item and caches the barcode->product mapping for next time.
+  function openBarcodeProduct(opts, onCancel, onSaved) {
+    var product = opts.product || {};
+    var barcode = String(opts.barcode || product.barcode || '');
+    var st = {
+      en: product.name || '',
+      he: product.he || '',
+      categoryId: product.categoryId || 'other',
+      unit: product.unit || 'pcs',
+      qty: 1,
+      emoji: product.emoji || null,
+      image: product.image || null,
+    };
+
+    var overlay = h('div', { class: 'overlay' });
+    var sheet = h('div', { class: 'sheet' });
+    function close(saved) {
+      overlay.remove();
+      if (saved) { if (onSaved) onSaved(); }
+      else if (onCancel) onCancel();
+    }
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(false); });
+
+    sheet.appendChild(h('div', { class: 'grabber' }));
+    sheet.appendChild(
+      h('div', { class: 'sheet-header' },
+        h('h2', { class: 'sheet-title', text: opts.isNew ? t('scan.newTitle') : t('scan.reviewTitle') }),
+        h('button', { class: 'sheet-close', 'aria-label': 'X', onclick: function () { close(false); } }, '✕')
+      )
+    );
+    var body = h('div', { class: 'sheet-body' });
+
+    if (opts.hint) body.appendChild(h('div', { class: 'scan-hint', text: opts.hint }));
+
+    // Photo
+    body.appendChild(h('label', { class: 'field-label', text: t('form.photo') }));
+    var photo = photoControl(st);
+    body.appendChild(photo.row);
+    body.appendChild(photo.input);
+
+    // Barcode (read-only)
+    body.appendChild(h('label', { class: 'field-label', text: t('scan.barcode') }));
+    var bcInput = h('input', { class: 'input', type: 'text', value: barcode, readonly: 'readonly' });
+    body.appendChild(bcInput);
+
+    // Names (English + Hebrew)
+    body.appendChild(h('label', { class: 'field-label', text: t('scan.enName') }));
+    var enInput = h('input', { class: 'input', type: 'text', value: st.en, placeholder: t('form.namePlaceholder'), autocomplete: 'off' });
+    body.appendChild(enInput);
+    body.appendChild(h('label', { class: 'field-label', text: t('scan.heName') }));
+    var heInput = h('input', { class: 'input', type: 'text', value: st.he, dir: 'rtl', autocomplete: 'off' });
+    body.appendChild(heInput);
+
+    if (product.brand)
+      body.appendChild(h('div', { class: 'scan-meta', text: t('scan.brand') + ': ' + product.brand + (product.size ? ' · ' + product.size : '') }));
+
+    // Category + unit + quantity
+    body.appendChild(h('label', { class: 'field-label', text: t('form.category') }));
+    body.appendChild(categoryChips(function () { return st.categoryId; }, function (v) { st.categoryId = v; photo.render(); }));
+    body.appendChild(h('label', { class: 'field-label', text: t('form.unit') }));
+    body.appendChild(unitChipsBox(function () { return st.unit; }, function (v) { st.unit = v; }));
+    body.appendChild(h('label', { class: 'field-label', text: t('form.quantity') }));
+    body.appendChild(stepperBox(function () { return st.qty; }, function (v) { st.qty = v; }));
+
+    sheet.appendChild(body);
+
+    function save() {
+      var en = enInput.value.trim();
+      var he = heInput.value.trim();
+      if (!en && !he) {
+        (en ? enInput : heInput).classList.add('error');
+        showToast(t('scan.nameRequired'));
+        return;
+      }
+      var primary = window.I18N.getLang() === 'he' ? he || en : en || he;
+      var emoji = st.emoji;
+      if (!emoji) {
+        var m = foodMatch(en || he);
+        if (m) emoji = m.emoji;
+      }
+      var existing = itemByBarcode(barcode);
+      var p;
+      if (existing) {
+        existing.quantity += st.qty;
+        if (st.image) existing.image = st.image;
+        p = window.PantryDB.put(existing).then(function () { recordDelta(st.qty); });
+      } else {
+        p = window.PantryDB.create({
+          name: primary, quantity: st.qty, unit: st.unit, categoryId: st.categoryId,
+          location: 'Pantry', barcode: barcode, emoji: emoji || null, image: st.image || null,
+        }).then(function (item) { recordDelta(item.quantity); });
+      }
+      p.then(function () {
+        window.PantryDB.putBarcode({
+          barcode: barcode, name: en, he: he, categoryId: st.categoryId,
+          unit: st.unit, image: st.image || null, emoji: emoji || null,
+          brand: product.brand || '', size: product.size || '',
+          source: opts.isNew ? 'user' : product.source || 'off',
+        });
+        close(true);
+      });
+    }
+
+    sheet.appendChild(
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn cancel', type: 'button', onclick: function () { close(false); } }, t('form.cancel')),
+        h('button', { class: 'btn save', type: 'button', onclick: save }, t('scan.save'))
+      )
+    );
+
+    overlay.appendChild(sheet);
+    document.body.appendChild(overlay);
+  }
+
+  // ---- Login screen (shown when no user is signed in) ----
+  function renderLogin() {
+    if (!root) root = document.getElementById('root');
+    // Clear any leftover overlays/sheets and the main UI.
+    Array.prototype.slice
+      .call(document.querySelectorAll('.overlay, .toast'))
+      .forEach(function (o) { o.remove(); });
+    root.innerHTML = '';
+
+    var langBtn = h(
+      'button',
+      {
+        class: 'lang-btn',
+        'aria-label': t('language.a11y'),
+        onclick: function () { openLang(renderLogin); },
+      },
+      '🌐 ' + (window.I18N.getLang() === 'he' ? 'עב' : 'EN')
+    );
+
+    var userInput = h('input', {
+      class: 'input', type: 'text', placeholder: t('auth.usernamePlaceholder'),
+      autocomplete: 'username', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false',
+    });
+    var passInput = h('input', {
+      class: 'input', type: 'password', placeholder: t('auth.passwordPlaceholder'),
+      autocomplete: 'current-password',
+    });
+    var errEl = h('div', { class: 'auth-error', style: 'display:none' });
+
+    function submit() {
+      var res = window.Auth.login(userInput.value, passInput.value);
+      if (res.ok) {
+        enterApp(res.username).then(function () {
+          showToast(t('auth.welcome', { name: res.username }));
+        });
+        return;
+      }
+      var key =
+        res.error === 'unknownUser' ? 'auth.errorUnknownUser'
+        : res.error === 'wrongPassword' ? 'auth.errorWrongPassword'
+        : 'auth.errorEmpty';
+      errEl.textContent = t(key);
+      errEl.style.display = 'block';
+      (res.error === 'wrongPassword' ? passInput : userInput).classList.add('error');
+    }
+
+    [userInput, passInput].forEach(function (inp) {
+      inp.addEventListener('input', function () {
+        errEl.style.display = 'none';
+        inp.classList.remove('error');
+      });
+      inp.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') submit();
+      });
+    });
+
+    var card = h(
+      'div',
+      { class: 'auth-card' },
+      h('div', { class: 'auth-top' }, langBtn),
+      h('div', { class: 'auth-logo', text: '🧺' }),
+      h('h1', { class: 'auth-title', text: t('auth.title') }),
+      h('p', { class: 'auth-subtitle', text: t('auth.subtitle') }),
+      h('label', { class: 'field-label', text: t('auth.username') }),
+      userInput,
+      h('label', { class: 'field-label', text: t('auth.password') }),
+      passInput,
+      errEl,
+      h('button', { class: 'btn save auth-submit', type: 'button', onclick: submit }, t('auth.login')),
+      h('p', { class: 'auth-hint', text: t('auth.demoHint') })
+    );
+    root.appendChild(h('div', { class: 'auth-screen' }, card));
+    setTimeout(function () { userInput.focus(); }, 50);
+  }
+
+  // ---- Auth / boot ----
+  function enterApp(username) {
+    window.PantryDB.setUser(username);
+    window.I18N.setUser(username); // load this user's language preference
+    return load().then(function () {
       recomputeShortfall();
       renderMain();
+    });
+  }
+
+  function doLogout() {
+    window.Auth.logout();
+    window.PantryDB.setUser(null);
+    window.I18N.setUser(null);
+    items = [];
+    renderLogin();
+    showToast(t('auth.loggedOut'));
+  }
+
+  function start() {
+    window.Auth.init(); // seed demo users (aviraz/aviraz, guest/guest)
+    window.I18N.init(); // shared language for the login screen
+    // One-time migration of any pre-auth data into the seeded 'aviraz' user.
+    window.PantryDB.migrateLegacyInto('aviraz').then(function () {
+      var user = window.Auth.currentUser();
+      if (user) enterApp(user);
+      else renderLogin();
     });
   }
 

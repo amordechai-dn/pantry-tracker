@@ -1,6 +1,6 @@
 /* Service worker: precache + cache-first, offline-capable, self-updating.
    Bump VERSION on every deploy to trigger an update for installed PWAs. */
-var VERSION = 'v1.3.0';
+var VERSION = 'v1.4.0';
 var CACHE = 'pantry-' + VERSION;
 
 var ASSETS = [
@@ -9,6 +9,7 @@ var ASSETS = [
   './styles.css',
   './i18n.js',
   './db.js',
+  './auth.js',
   './app.js',
   './pwa.js',
   './vendor/zxing.min.js',
