@@ -356,6 +356,37 @@ async function rejects(name, fn) {
     ok(k + ' (en+he present, non-key, distinct)', en !== k && he !== k && en !== he);
   });
 
+  // 20) Switch User vs Manage Users separation + fast switching
+  console.log('\n[user UX: switch vs manage separation]');
+  var App = global.window.App;
+  ok('Switch User + Manage Users are two DISTINCT screen renderers',
+    typeof App.renderSwitchUser === 'function' &&
+    typeof App.renderManageUsers === 'function' &&
+    App.renderSwitchUser !== App.renderManageUsers);
+  // New separation strings exist in both languages.
+  ['auth.switchUser', 'auth.manageUsers', 'auth.switchUserSub', 'auth.manageUsersSub',
+   'auth.back', 'settings.title', 'settings.editProfile'].forEach(function (k) {
+    I18N.setLang('en'); var en = I18N.t(k);
+    I18N.setLang('he'); var he = I18N.t(k);
+    ok(k + ' (en+he present, non-key)', en !== k && he !== k);
+  });
+
+  // Switching sets the active user and loads THAT user's scope only.
+  console.log('\n[user UX: switching loads correct scope]');
+  Auth.selectUser('guest'); DB.setUser(CurrentUser.id());
+  ok('switch -> active user is guest', CurrentUser.id() === 'guest');
+  var guestInv = await DB.getAll();
+  ok('guest scope is isolated (no aviraz-only items)', !guestInv.some(function (x) { return x.id === 'legacy1'; }));
+  Auth.selectUser('aviraz'); DB.setUser(CurrentUser.id());
+  var avInv2 = await DB.getAll();
+  ok('switch back -> active user is aviraz', CurrentUser.id() === 'aviraz');
+  ok('aviraz scope reloaded with its own items (incl. legacy1)', avInv2.some(function (x) { return x.id === 'legacy1'; }) && avInv2.length >= 2);
+  // The switch action never mutates profiles (no edit/delete on that path).
+  var before = JSON.stringify(Auth.listUsers().map(function (u) { return u.id + ':' + (u.displayName || ''); }).sort());
+  Auth.selectUser('guest'); Auth.selectUser('aviraz'); // rapid switches
+  var after = JSON.stringify(Auth.listUsers().map(function (u) { return u.id + ':' + (u.displayName || ''); }).sort());
+  ok('rapid switching leaves all profiles unchanged (no edits)', before === after);
+
   console.log('\n============================');
   console.log('PASS ' + pass + '  FAIL ' + fail);
   console.log('============================');

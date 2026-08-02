@@ -752,7 +752,7 @@
     reopenTop = null;
     // Re-render whichever base screen is currently active.
     if (window.CurrentUser && window.CurrentUser.id()) renderMain();
-    else renderPicker();
+    else renderSwitchUser();
     try {
       window.scrollTo(0, y);
     } catch (e) {}
@@ -804,13 +804,24 @@
       },
       '📅'
     );
+    var settingsBtn = h(
+      'button',
+      {
+        class: 'icon-btn',
+        'aria-label': t('settings.a11y'),
+        title: t('settings.title'),
+        onclick: openSettings,
+      },
+      '⚙️'
+    );
+    // Header avatar is now a pure ONE-TAP entry to the Switch User screen.
     var profileBtn = h(
       'button',
       {
         class: 'icon-btn profile-btn',
-        'aria-label': t('auth.profile'),
-        title: window.CurrentUser ? window.CurrentUser.displayName() : t('auth.profile'),
-        onclick: openProfile,
+        'aria-label': t('auth.switchUser'),
+        title: t('auth.switchUser'),
+        onclick: renderSwitchUser,
       },
       avatarEl('sm')
     );
@@ -827,7 +838,7 @@
       h(
         'div',
         { class: 'header-actions' },
-        h('div', { class: 'header-btn-row' }, monthlyBtn, langBtn, profileBtn),
+        h('div', { class: 'header-btn-row' }, monthlyBtn, langBtn, settingsBtn, profileBtn),
         h('span', { class: 'version', id: 'version', text: window.APP_VERSION || '' })
       )
     );
@@ -2645,16 +2656,54 @@
     return box;
   }
 
-  // ---- Profile picker (shown when no active user / on switch) ----
-  // Open household profiles: tap to enter immediately, no password.
-  function renderPicker() {
+  // Clear the base screen (remove any overlays/toasts + wipe root).
+  function resetRoot() {
     if (!root) root = document.getElementById('root');
     Array.prototype.slice
       .call(document.querySelectorAll('.overlay, .toast'))
       .forEach(function (o) { o.remove(); });
     root.innerHTML = '';
+  }
 
-    // Shared language toggle (also the default language for new profiles).
+  // A minimal in-app screen top bar with a Back button (RTL-safe: text label,
+  // no directional glyph) and a title.
+  function screenTopBar(title, onBack) {
+    return h('div', { class: 'screen-topbar' },
+      h('button', { class: 'btn ghost back-btn', type: 'button', onclick: onBack }, t('auth.back')),
+      h('h2', { class: 'screen-topbar-title', text: title })
+    );
+  }
+
+  // Large avatar tile for the user cards.
+  function userAvatarTile(u) {
+    return u.avatar
+      ? h('div', { class: 'avatar xl has-img' }, h('img', { class: 'avatar-img', src: u.avatar, alt: '' }))
+      : h('div', { class: 'avatar xl', text: initialsOf(u.displayName || u.username) });
+  }
+
+  // ---- SWITCH USER screen (one-tap, no editing) ----
+  // Shown at boot (no active user) and from the header avatar. Tapping a
+  // profile switches to it immediately and returns to the app. This screen has
+  // NO create/edit/delete affordances — management lives in Manage Users.
+  function renderSwitchUser() {
+    resetRoot();
+    var activeId = window.CurrentUser ? window.CurrentUser.id() : null;
+    var users = window.Auth.listUsers();
+
+    function pick(id) {
+      // Fast path: tapping the already-active profile just returns to the app
+      // with NO database reload (its data is already in memory).
+      if (activeId && id === activeId) { renderMain(); return; }
+      var u = window.Auth.selectUser(id);
+      if (!u) { renderSwitchUser(); return; }
+      // enterApp() loads ONLY the selected user's scope (per-user IndexedDB).
+      enterApp().then(function () {
+        showToast(t('auth.welcome', { name: window.CurrentUser.displayName() }));
+      });
+    }
+
+    // Shared language toggle (also the default language for new profiles). Kept
+    // because it is a language control, not a user-management action.
     var langSel = h('div', { class: 'segment auth-lang' });
     [['en', 'English'], ['he', 'עברית']].forEach(function (pair) {
       langSel.appendChild(
@@ -2666,36 +2715,52 @@
       );
     });
 
-    var activeId = window.CurrentUser ? window.CurrentUser.id() : null;
-    var users = window.Auth.listUsers();
-
-    function pick(id) {
-      var u = window.Auth.selectUser(id);
-      if (!u) { renderPicker(); return; }
-      enterApp().then(function () {
-        showToast(t('auth.welcome', { name: window.CurrentUser.displayName() }));
-      });
-    }
-
     var grid = h('div', { class: 'user-grid' });
     users.forEach(function (u) {
-      var av = u.avatar
-        ? h('div', { class: 'avatar xl has-img' }, h('img', { class: 'avatar-img', src: u.avatar, alt: '' }))
-        : h('div', { class: 'avatar xl', text: initialsOf(u.displayName || u.username) });
       grid.appendChild(
         h('div', { class: 'user-card' + (u.id === activeId ? ' active' : ''), onclick: function () { pick(u.id); } },
           u.id === activeId ? h('span', { class: 'user-active-badge', text: t('auth.activeUser') }) : null,
-          h('button', {
-            class: 'user-edit-btn', type: 'button', 'aria-label': t('auth.editUser'), title: t('auth.editUser'),
-            onclick: function (e) { e.stopPropagation(); renderEditUser(u); },
-          }, '✏️'),
-          av,
+          userAvatarTile(u),
           h('div', { class: 'user-card-name', dir: 'auto', text: u.displayName || u.username }),
           u.username ? h('div', { class: 'user-card-sub', text: '@' + u.username }) : null
         )
       );
     });
-    // "Add user" card.
+
+    root.appendChild(
+      h('div', { class: 'picker-screen' },
+        // Back to the app only when there is an active session to return to.
+        activeId ? screenTopBar(t('auth.switchUser'), function () { renderMain(); }) : null,
+        activeId ? null : h('img', { class: 'brand-logo', src: './icons/icon-192.png', alt: '' }),
+        activeId ? null : h('h1', { class: 'auth-title', text: t('app.title') }),
+        h('p', { class: 'auth-subtitle', text: activeId ? t('auth.switchUserSub') : t('auth.chooseUser') }),
+        langSel,
+        grid
+      )
+    );
+  }
+
+  // ---- MANAGE USERS screen (the ONLY place for create/edit/delete) ----
+  // Reached from Settings -> Manage Users. Tapping a card EDITS that profile
+  // (never switches); the add card creates one. Switching is not possible here.
+  function renderManageUsers() {
+    resetRoot();
+    var activeId = window.CurrentUser ? window.CurrentUser.id() : null;
+    var users = window.Auth.listUsers();
+
+    var grid = h('div', { class: 'user-grid' });
+    users.forEach(function (u) {
+      grid.appendChild(
+        h('div', { class: 'user-card manage', onclick: function () { renderEditUser(u); } },
+          u.id === activeId ? h('span', { class: 'user-active-badge', text: t('auth.activeUser') }) : null,
+          h('span', { class: 'user-edit-hint', 'aria-hidden': 'true', text: '✏️' }),
+          userAvatarTile(u),
+          h('div', { class: 'user-card-name', dir: 'auto', text: u.displayName || u.username }),
+          u.username ? h('div', { class: 'user-card-sub', text: '@' + u.username }) : null
+        )
+      );
+    });
+    // "Add user" card — creation lives only here.
     grid.appendChild(
       h('div', { class: 'user-card user-add', onclick: function () { renderCreateUser(); } },
         h('div', { class: 'user-add-plus', text: '＋' }),
@@ -2705,14 +2770,15 @@
 
     root.appendChild(
       h('div', { class: 'picker-screen' },
-        h('img', { class: 'brand-logo', src: './icons/icon-192.png', alt: '' }),
-        h('h1', { class: 'auth-title', text: t('app.title') }),
-        h('p', { class: 'auth-subtitle', text: t('auth.chooseUser') }),
-        langSel,
+        screenTopBar(t('auth.manageUsers'), function () { renderMain(); }),
+        h('p', { class: 'auth-subtitle', text: t('auth.manageUsersSub') }),
         grid
       )
     );
   }
+
+  // Back-compat alias: any legacy caller lands on the fast Switch User screen.
+  var renderPicker = renderSwitchUser;
 
   // ---- Create profile ----
   function renderCreateUser() {
@@ -2747,9 +2813,11 @@
             errEl.style.display = 'block';
             return;
           }
+          // Management context: create the profile but do NOT switch to it.
+          // Switching is a separate, one-tap action on the Switch User screen.
           close();
-          window.Auth.selectUser(res.user.id);
-          enterApp().then(function () { showToast(t('auth.userCreated')); });
+          renderManageUsers();
+          showToast(t('auth.userCreated'));
         });
     }
 
@@ -2794,11 +2862,11 @@
         if (window.I18N.getLang() !== state.lang) window.I18N.setLang(state.lang);
       }
       close();
-      renderPicker();
+      renderManageUsers();
     }
     function del() {
       if (isActive) { showToast(t('auth.cannotDeleteActive')); return; }
-      confirmDeleteUser(u, function () { close(); renderPicker(); });
+      confirmDeleteUser(u, function () { close(); renderManageUsers(); });
     }
 
     var dialog = h('div', { class: 'dialog profile-dialog' },
@@ -2903,15 +2971,72 @@
       cu.username() ? h('div', { class: 'profile-username', text: '@' + cu.username() }) : null,
       h('label', { class: 'field-label', text: t('auth.preferredLanguage') }),
       langBox,
-      h('button', { class: 'btn ghost profile-switch', type: 'button', onclick: function () { close(); renderPicker(); } }, t('auth.switchUser')),
       h('div', { class: 'actions' },
-        h('button', { class: 'btn cancel', type: 'button', onclick: function () { close(); chooseAnother(); } }, t('auth.chooseAnother')),
+        h('button', { class: 'btn cancel', type: 'button', onclick: close }, t('form.cancel')),
         h('button', { class: 'btn save', type: 'button', onclick: save }, t('auth.save'))
       )
     );
     overlay.appendChild(dialog);
     document.body.appendChild(overlay);
     setTimeout(function () { nameInput.focus(); }, 50);
+  }
+
+  // ---- Settings (gear) ----
+  // Home for account + app management: edit profile, Switch User, Manage Users
+  // (the only place for create/edit/delete), language, and sign-out. Keeping
+  // these here frees the header avatar to be a pure one-tap Switch User entry.
+  function openSettings() {
+    var cu = window.CurrentUser;
+    var overlay = h('div', { class: 'overlay center' });
+
+    // Reopen (translated) after a live language change, like the other dialogs.
+    var prevReopen = reopenTop;
+    var myReopen = function () { openSettings(); };
+    reopenTop = myReopen;
+    function close() {
+      overlay.remove();
+      if (reopenTop === myReopen) reopenTop = prevReopen;
+    }
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+
+    var state = { lang: window.I18N.getLang() };
+    var langBox = langSegment(state, function (l) {
+      window.Auth.updateProfile({ lang: l });
+      changeLanguage(l);
+    });
+
+    function row(label, sub, onClick) {
+      return h('button', { class: 'settings-row', type: 'button', onclick: onClick },
+        h('span', { class: 'settings-row-main' },
+          h('span', { class: 'settings-row-label', dir: 'auto', text: label }),
+          sub ? h('span', { class: 'settings-row-sub', text: sub }) : null
+        ),
+        h('span', { class: 'settings-row-chevron', 'aria-hidden': 'true', text: '›' })
+      );
+    }
+
+    var dialog = h('div', { class: 'dialog settings-dialog' },
+      h('div', { class: 'sheet-header' },
+        h('h2', { class: 'dialog-title', text: t('settings.title') }),
+        h('button', { class: 'sheet-close', 'aria-label': t('a11y.close'), onclick: close }, '✕')
+      ),
+      h('div', { class: 'settings-account' },
+        avatarEl('lg'),
+        h('div', { class: 'settings-account-info' },
+          h('div', { class: 'settings-account-name', dir: 'auto', text: cu ? cu.displayName() : '' }),
+          cu && cu.username() ? h('div', { class: 'settings-account-sub', text: '@' + cu.username() }) : null
+        )
+      ),
+      row(t('settings.editProfile'), null, function () { close(); openProfile(); }),
+      row(t('auth.switchUser'), t('auth.switchUserSub'), function () { close(); renderSwitchUser(); }),
+      row(t('auth.manageUsers'), t('auth.manageUsersSub'), function () { close(); renderManageUsers(); }),
+      h('label', { class: 'field-label', text: t('auth.preferredLanguage') }),
+      langBox,
+      h('button', { class: 'btn ghost', type: 'button', onclick: function () { close(); chooseAnother(); } }, t('auth.chooseAnother')),
+      h('div', { class: 'settings-version', text: t('app.versionLabel') + ' ' + (window.APP_VERSION || '') })
+    );
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
   }
 
   // ---- Auth / boot ----
@@ -2941,7 +3066,7 @@
     window.PantryDB.setUser(null); // drop data scope
     window.I18N.setUser(null); // back to the shared picker language
     items = [];
-    renderPicker();
+    renderSwitchUser();
   }
 
   // Seed the shared Guest profile's inventory with distinct sample data so
@@ -2983,16 +3108,19 @@
       .then(function () {
         var st = window.Auth.restore(); // 'ok' | 'none'
         if (st === 'ok') enterApp();
-        else renderPicker();
+        else renderSwitchUser();
       })
       .catch(function () {
-        renderPicker();
+        renderSwitchUser();
       });
   }
 
   window.App = {
     start: start,
     renderMain: renderMain,
+    // Two DISTINCT screens: fast one-tap switching vs. full CRUD management.
+    renderSwitchUser: renderSwitchUser,
+    renderManageUsers: renderManageUsers,
     // Pure, DOM-free helpers exposed for the automated logic harness.
     _internals: {
       detectLang: detectLang,
