@@ -18,6 +18,9 @@
 --     client — RLS + anon auth are the enforcement boundary.
 -- ============================================================================
 
+-- pgcrypto provides digest()/gen_random_uuid(). On Supabase it lives in the
+-- `extensions` schema, so every SECURITY DEFINER function below sets
+-- search_path = public, extensions (otherwise digest() is "not found").
 create extension if not exists pgcrypto;
 
 -- ----------------------------------------------------------------- identity --
@@ -46,7 +49,7 @@ create index if not exists idx_dl_household on device_links(household_id);
 
 -- Convenience: households the current caller belongs to.
 create or replace function my_households()
-returns setof uuid language sql stable security definer set search_path = public as $$
+returns setof uuid language sql stable security definer set search_path = public, extensions as $$
   select household_id from household_members where member_uid = auth.uid();
 $$;
 
@@ -223,7 +226,7 @@ create policy hh_select on households
 -- --------------------------------------------------------------- link RPCs --
 -- First device: create a household and enroll the caller as the first member.
 create or replace function create_household()
-returns uuid language plpgsql security definer set search_path = public as $$
+returns uuid language plpgsql security definer set search_path = public, extensions as $$
 declare hid uuid;
 begin
   if auth.uid() is null then raise exception 'not authenticated'; end if;
@@ -235,7 +238,7 @@ end $$;
 -- Existing member: mint a link token (stored only as a digest). Raw token is
 -- provided by the caller (crypto-random on the client) and never persisted.
 create or replace function create_link_token(p_token text, p_expires_minutes int default 60)
-returns uuid language plpgsql security definer set search_path = public as $$
+returns uuid language plpgsql security definer set search_path = public, extensions as $$
 declare hid uuid; lid uuid;
 begin
   select household_id into hid from household_members where member_uid = auth.uid() limit 1;
@@ -249,7 +252,7 @@ end $$;
 -- New device: redeem a token to join the household. SECURITY DEFINER so a
 -- not-yet-member caller can enroll themselves iff they present a valid token.
 create or replace function redeem_link_token(p_token text)
-returns uuid language plpgsql security definer set search_path = public as $$
+returns uuid language plpgsql security definer set search_path = public, extensions as $$
 declare hid uuid;
 begin
   if auth.uid() is null then raise exception 'not authenticated'; end if;
@@ -265,7 +268,7 @@ end $$;
 
 -- Regenerate: revoke every outstanding token for the caller's household.
 create or replace function revoke_link_tokens()
-returns int language plpgsql security definer set search_path = public as $$
+returns int language plpgsql security definer set search_path = public, extensions as $$
 declare hid uuid; n int;
 begin
   select household_id into hid from household_members where member_uid = auth.uid() limit 1;

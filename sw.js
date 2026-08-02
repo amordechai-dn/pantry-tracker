@@ -1,6 +1,6 @@
 /* Service worker: precache + cache-first, offline-capable, self-updating.
    Bump VERSION on every deploy to trigger an update for installed PWAs. */
-var VERSION = 'v1.11.0';
+var VERSION = 'v1.12.0';
 var CACHE = 'pantry-' + VERSION;
 
 // Critical-path assets for first paint + full offline. Kept lean: only what
@@ -20,6 +20,9 @@ var ASSETS = [
   // Scanner library: precached so the lazy load (on first scanner open) still
   // resolves from cache offline, but it is NOT on the startup/parse path.
   './vendor/zxing.min.js',
+  // Vendored QR generator (local, no CDN). Lazy-loaded when showing a device
+  // link QR; precached so it works offline. Off the startup/parse path.
+  './vendor/qrcode.js',
   // Cross-device sync layer: precached so it resolves offline, but (like the
   // scanner) it is lazy-loaded only when a backend is configured + linked, so
   // it stays off the startup/parse path and the app is offline-first by default.

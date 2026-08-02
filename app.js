@@ -3008,7 +3008,31 @@
   var SYNC_ANON_KEY = 'pantry.sync.anonKey';
   var syncMgr = null; // HomeSync.SyncManager instance (when active)
   var homeSyncPromise = null; // lazy-load promise for sync/homesync.js
+  var qrPromise = null; // lazy-load promise for vendor/qrcode.js
   var suppressSyncHook = false; // guard so remote-applied writes don't re-queue
+  var pendingLinkToken = null; // a #link= token captured at startup (auto-join)
+
+  // Parse a device-link token from the current URL (#link= or ?link=).
+  function parseLinkToken() {
+    try {
+      var m =
+        /[#&?]link=([^&]+)/.exec(location.hash || '') ||
+        /[?&]link=([^&]+)/.exec(location.search || '');
+      return m ? decodeURIComponent(m[1]) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  // Remove the link token from the URL so it isn't re-processed or shared.
+  function cleanLinkUrl() {
+    try {
+      if (!history.replaceState) return;
+      var search = (location.search || '').replace(/([?&])link=[^&]*/, '$1').replace(/[?&]$/, '');
+      var hash = (location.hash || '').replace(/([#&])link=[^&]*/, '$1').replace(/[#&]$/, '');
+      if (hash === '#') hash = '';
+      history.replaceState(null, '', location.pathname + search + hash);
+    } catch (e) {}
+  }
 
   // Effective config: Settings (localStorage) overrides config.js. Pure read.
   function syncGetConfig() {
@@ -3229,6 +3253,61 @@
     });
   }
 
+  // Auto-join from a #link= token (opened link / scanned QR). Reuses the same
+  // redeem_link_token flow — no manual code entry. Backend config is baked, so
+  // the token is all that's needed. No-op when unconfigured.
+  function syncAutoRedeem(token) {
+    if (!token || !syncConfigured()) return Promise.resolve(false);
+    return loadHomeSync()
+      .then(function (HS) {
+        var cfg = syncGetConfig();
+        var st = syncLoadState();
+        var repo = new HS.CloudRepository(cfg, st.session);
+        var ensure = st.session ? Promise.resolve() : repo.signInAnonymously();
+        return ensure.then(function () {
+          return repo.redeemLinkToken(String(token).trim()).then(function (hid) {
+            syncSaveState({
+              cloudUserId: hid,
+              session: repo.session,
+              deviceId: st.deviceId || HS.DeviceLink.generateToken(8),
+            });
+            syncBoot();
+            if (typeof showToast === 'function') showToast(t('sync.linkedOk'));
+            renderMain();
+            return true;
+          });
+        });
+      })
+      .catch(function () {
+        if (typeof showToast === 'function') showToast(t('sync.errLink'));
+        return false;
+      });
+  }
+
+  // Lazy-load the vendored (local, no-CDN) QR generator.
+  function loadQR() {
+    if (window.QRCodeMini) return Promise.resolve(window.QRCodeMini);
+    if (qrPromise) return qrPromise;
+    qrPromise = new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = './vendor/qrcode.js';
+      s.async = true;
+      s.onload = function () {
+        if (window.QRCodeMini) resolve(window.QRCodeMini);
+        else {
+          qrPromise = null;
+          reject(new Error('QR generator unavailable'));
+        }
+      };
+      s.onerror = function () {
+        qrPromise = null;
+        reject(new Error('Failed to load QR generator'));
+      };
+      document.head.appendChild(s);
+    });
+    return qrPromise;
+  }
+
   // Existing member: mint a fresh crypto-random link token for another device.
   function syncCreateLinkCode() {
     return loadHomeSync().then(function (HS) {
@@ -3345,15 +3424,25 @@
           linkArea.appendChild(note('…'));
           syncCreateLinkCode().then(function (token) {
             linkArea.innerHTML = '';
+            var base = location.origin + location.pathname;
             var url = window.HomeSync
-              ? window.HomeSync.DeviceLink.buildLinkUrl(location.origin + location.pathname, token)
-              : token;
+              ? window.HomeSync.DeviceLink.buildLinkUrl(base, token)
+              : base + '#link=' + encodeURIComponent(token);
+            // QR of the deep link — scan on another device to auto-join.
+            linkArea.appendChild(h('p', { class: 'sync-note', text: t('sync.scanToJoin') }));
+            var qrWrap = h('div', { class: 'sync-qr' });
+            var canvas = h('canvas', { 'aria-label': t('sync.linkUrl') });
+            qrWrap.appendChild(canvas);
+            linkArea.appendChild(qrWrap);
+            loadQR()
+              .then(function (QR) { QR.toCanvas(canvas, url, { scale: 5, border: 3 }); })
+              .catch(function () { qrWrap.remove(); });
             var codeField = h('input', { class: 'input mono', type: 'text', readonly: 'readonly', value: token, dir: 'ltr' });
             var urlField = h('input', { class: 'input mono', type: 'text', readonly: 'readonly', value: url, dir: 'ltr' });
             linkArea.appendChild(h('label', { class: 'field-label', text: t('sync.linkCode') }));
             linkArea.appendChild(codeField);
             linkArea.appendChild(btn(t('sync.copy'), 'ghost', function () {
-              try { navigator.clipboard.writeText(token); } catch (e) {}
+              try { navigator.clipboard.writeText(url); } catch (e) {}
             }));
             linkArea.appendChild(h('label', { class: 'field-label', text: t('sync.linkUrl') }));
             linkArea.appendChild(urlField);
@@ -3411,24 +3500,30 @@
         }));
       }
 
-      // Backend settings (URL + anon key) — always available.
+      // Backend override (URL + anon key) — ADVANCED + optional, tucked away in
+      // a collapsed disclosure. Prefilled from the baked config; not needed for
+      // normal use (every device ships already configured via config.js).
       var cfg = syncGetConfig();
       var urlInput = h('input', { class: 'input', type: 'url', value: cfg.url, placeholder: 'https://xxxx.supabase.co', dir: 'ltr' });
-      var anonInput = h('input', { class: 'input mono', type: 'text', value: cfg.anonKey, placeholder: 'eyJhbGci…', dir: 'ltr' });
-      body.appendChild(h('h3', { class: 'sync-subhead', text: t('sync.backendSettings') }));
-      body.appendChild(h('label', { class: 'field-label', text: t('sync.supabaseUrl') }));
-      body.appendChild(urlInput);
-      body.appendChild(h('label', { class: 'field-label', text: t('sync.anonKey') }));
-      body.appendChild(anonInput);
-      body.appendChild(h('p', { class: 'sync-note', text: t('sync.anonKeyHint') }));
-      body.appendChild(btn(t('sync.save'), 'save', function () {
-        try {
-          localStorage.setItem(SYNC_URL_KEY, urlInput.value.trim());
-          localStorage.setItem(SYNC_ANON_KEY, anonInput.value.trim());
-        } catch (e) {}
-        showToast(t('sync.saved'));
-        rebuild();
-      }));
+      var anonInput = h('input', { class: 'input mono', type: 'text', value: cfg.anonKey, placeholder: 'sb_publishable_… / eyJhbGci…', dir: 'ltr' });
+      var advanced = h('details', { class: 'sync-advanced' },
+        h('summary', { text: t('sync.backendSettings') }),
+        h('p', { class: 'sync-note', text: t('sync.backendSettingsSub') }),
+        h('label', { class: 'field-label', text: t('sync.supabaseUrl') }),
+        urlInput,
+        h('label', { class: 'field-label', text: t('sync.anonKey') }),
+        anonInput,
+        h('p', { class: 'sync-note', text: t('sync.anonKeyHint') }),
+        btn(t('sync.save'), 'save', function () {
+          try {
+            localStorage.setItem(SYNC_URL_KEY, urlInput.value.trim());
+            localStorage.setItem(SYNC_ANON_KEY, anonInput.value.trim());
+          } catch (e) {}
+          showToast(t('sync.saved'));
+          rebuild();
+        })
+      );
+      body.appendChild(advanced);
     }
 
     var dialog = h('div', { class: 'dialog settings-dialog' },
@@ -3519,6 +3614,12 @@
         renderMain();
         // Wake cross-device sync ONLY if configured + linked (else dormant).
         syncBoot();
+        // If we arrived via a device-link URL / QR, auto-join now.
+        if (pendingLinkToken) {
+          var tk = pendingLinkToken;
+          pendingLinkToken = null;
+          syncAutoRedeem(tk);
+        }
       });
   }
 
@@ -3561,6 +3662,10 @@
 
   function start() {
     window.I18N.init(); // shared language for the picker
+    // Capture a device-link token from the URL (opened link / scanned QR) and
+    // scrub it from the address bar; it is redeemed once a profile is active.
+    pendingLinkToken = parseLinkToken();
+    if (pendingLinkToken) cleanLinkUrl();
     window.Auth.init() // migrate old password profiles -> open profiles; seed demos
       .then(function () { return seedGuestUserData(); })
       .then(function () {
@@ -3595,6 +3700,8 @@
       syncConfigured: syncConfigured,
       cloudTableFor: cloudTableFor,
       mapItemToCloud: mapItemToCloud,
+      parseLinkToken: parseLinkToken,
+      syncAutoRedeem: syncAutoRedeem,
     },
   };
 })();

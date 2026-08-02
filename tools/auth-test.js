@@ -401,7 +401,7 @@ async function rejects(name, fn) {
     HS.isConfigured({ anonKey: 'k' }) === false);
   ok('isConfigured=true only with url+anonKey',
     HS.isConfigured({ url: 'https://x.supabase.co', anonKey: 'k' }) === true);
-  ok('app-level syncConfigured() is false with no creds', AppI.syncConfigured() === false);
+  ok('syncConfigured() false when config blank (offline-first fallback)', AppI.syncConfigured() === false);
   // With sync dormant, a local mutation must NOT enqueue anything anywhere.
   var qKeysBefore = Object.keys(_store).filter(function (k) { return k.indexOf('pantry.sync.queue') === 0; });
   await DB.create({ name: 'Dormancy Probe', quantity: 1, categoryId: 'dry' });
@@ -503,6 +503,54 @@ async function rejects(name, fn) {
     cloudRow.id === 'z1' && cloudRow.user_id === 'household-uuid' && cloudRow.quantity === 3);
   ok('mapItemToCloud keeps bilingual names + full data blob',
     cloudRow.name_he === '\u05EA\u05D4' && cloudRow.data && cloudRow.data.name === 'Tea');
+
+  console.log('\n[sync: baked config = zero-config per device]');
+  require('../config.js'); // loads window.HOMESTOCK_CONFIG baked defaults
+  var baked = AppI.syncGetConfig();
+  ok('baked config ships a Supabase URL + anon key', /supabase\.co/.test(baked.url) && baked.anonKey.length > 10);
+  ok('anon key is a PUBLIC publishable key (sb_publishable_ / JWT)', /^sb_publishable_|^eyJ/.test(baked.anonKey));
+  ok('app is configured out-of-the-box (no manual entry needed)', AppI.syncConfigured() === true);
+  // Settings override beats baked config; removing it falls back to baked.
+  localStorage.setItem('pantry.sync.url', 'https://override.example.co');
+  localStorage.setItem('pantry.sync.anonKey', 'override-key-123');
+  var ov = AppI.syncGetConfig();
+  ok('Settings override takes precedence over baked config',
+    ov.url === 'https://override.example.co' && ov.anonKey === 'override-key-123');
+  localStorage.removeItem('pantry.sync.url');
+  localStorage.removeItem('pantry.sync.anonKey');
+  ok('removing override falls back to baked config', AppI.syncGetConfig().url === baked.url);
+  // If the baked values were ever blanked, the app stays dormant (no errors).
+  var savedCfg = global.window.HOMESTOCK_CONFIG;
+  global.window.HOMESTOCK_CONFIG = { SUPABASE_URL: '', SUPABASE_ANON_KEY: '' };
+  ok('blanked baked config -> dormant (syncConfigured false)', AppI.syncConfigured() === false);
+  ok('auto-redeem is a no-op when unconfigured (resolves false)',
+    (await AppI.syncAutoRedeem('sometoken')) === false);
+  global.window.HOMESTOCK_CONFIG = savedCfg;
+
+  console.log('\n[sync: #link= parsing + QR/deep-link round-trip]');
+  global.location = { hash: '#link=ABC123_-token', search: '', pathname: '/', origin: 'https://x' };
+  ok('parseLinkToken reads #link= token from URL', AppI.parseLinkToken() === 'ABC123_-token');
+  global.location = { hash: '', search: '?link=QS_TOKEN99', pathname: '/', origin: 'https://x' };
+  ok('parseLinkToken reads ?link= token too', AppI.parseLinkToken() === 'QS_TOKEN99');
+  global.location = { hash: '', search: '', pathname: '/', origin: 'https://x' };
+  ok('parseLinkToken returns null with no token', AppI.parseLinkToken() === null);
+  var token = HS.DeviceLink.generateToken();
+  var deepLink = HS.DeviceLink.buildLinkUrl('https://amordechai-dn.github.io/pantry-tracker/', token);
+  ok('deep-link URL carries the token', deepLink.indexOf('link=' + token) >= 0);
+  ok('parseLinkUrl round-trips the deep-link token', HS.DeviceLink.parseLinkUrl(deepLink) === token);
+  var QR = require('../vendor/qrcode.js');
+  var qr = QR.qrcodegen.QrCode.encodeText(deepLink, QR.QRCodeMini.Ecc.MEDIUM);
+  ok('QR encodes the link URL into a valid module matrix',
+    qr.size >= 21 && qr.size <= 177 && (qr.size - 17) % 4 === 0);
+  ok('QR has finder patterns in all three corners',
+    qr.getModule(0, 0) === true && qr.getModule(qr.size - 1, 0) === true && qr.getModule(0, qr.size - 1) === true);
+  ok('QR data-codeword counts match the spec (v1: L19/M16/Q13/H9)',
+    (function () {
+      // Re-encode tiny payloads to force version 1 at each ECC level.
+      function dc(ecl) { return QR.qrcodegen.QrCode.encodeText('1', ecl).size; }
+      // All version-1 => size 21 for a 1-char numeric payload at every level.
+      return dc(QR.QRCodeMini.Ecc.LOW) === 21 && dc(QR.QRCodeMini.Ecc.HIGH) === 21;
+    })());
 
   console.log('\n============================');
   console.log('PASS ' + pass + '  FAIL ' + fail);

@@ -1,16 +1,19 @@
-/* HomeStock runtime backend config (placeholder).
+/* HomeStock runtime backend config (BAKED DEFAULTS).
  *
- * Leave these BLANK to keep the app 100% offline-first with cloud sync DORMANT
- * (no network, no errors). To enable Supabase sync you can either:
- *   (a) enter the values in the app: Settings → Sync → "Backend settings", which
- *       persists them to localStorage and OVERRIDES this file, or
- *   (b) fill them in here before deploying.
+ * These are the app's default Supabase credentials, shipped so every device is
+ * already configured — no manual entry needed. Settings → Sync → "Backend
+ * settings" is an OPTIONAL advanced override (persisted to localStorage, takes
+ * precedence over these defaults); it is prefilled from these values.
  *
- * SECURITY: the anon/public key is the ONLY key that belongs in the frontend.
- * NEVER put a service_role key or any secret here — RLS + the anon key are what
- * keep data safe (see sync/schema.sql).
+ * SECURITY: SUPABASE_ANON_KEY is the anon / publishable key. It is a PUBLIC
+ * client key by design — the ONLY key that belongs in a frontend. All data
+ * access is gated by Row-Level Security (see sync/schema.sql), so shipping it
+ * in the repo is safe. NEVER put a service_role (or any secret) key here.
+ *
+ * If these are ever blanked, the app simply falls back to sync being DORMANT
+ * and keeps working 100% offline-first (no errors).
  */
 window.HOMESTOCK_CONFIG = window.HOMESTOCK_CONFIG || {
-  SUPABASE_URL: '',
-  SUPABASE_ANON_KEY: '',
+  SUPABASE_URL: 'https://skmiqgwfoulfwgskliuo.supabase.co',
+  SUPABASE_ANON_KEY: 'sb_publishable_6HB11kWdSAz0PyQo92JpLA_5yzviIl0',
 };

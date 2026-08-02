@@ -169,7 +169,11 @@
         dormantNote:
           'Sync is off. HomeStock works fully offline. Add a Supabase backend to sync across devices.',
         setupGuide: 'Follow the setup guide to create a free backend.',
-        backendSettings: 'Backend settings',
+        backendSettings: 'Advanced: backend settings',
+        backendSettingsSub:
+          'Optional override. This app already ships configured — you normally never need this.',
+        scanToJoin: 'Scan this on another device to join instantly.',
+        linkedOk: 'Device linked — syncing.',
         supabaseUrl: 'Supabase URL',
         anonKey: 'Anon (public) key',
         anonKeyHint: 'Only the public anon key — never a service_role key.',
@@ -426,7 +430,11 @@
         dormantNote:
           'הסנכרון כבוי. HomeStock עובד לגמרי לא־מקוון. הוסיפו שרת Supabase כדי לסנכרן בין מכשירים.',
         setupGuide: 'עקבו אחר מדריך ההתקנה כדי ליצור שרת חינמי.',
-        backendSettings: 'הגדרות שרת',
+        backendSettings: 'מתקדם: הגדרות שרת',
+        backendSettingsSub:
+          'עקיפה אופציונלית. האפליקציה כבר מגיעה מוגדרת — בדרך כלל אין צורך בזה.',
+        scanToJoin: 'סרקו את הקוד ממכשיר אחר כדי להצטרף מיד.',
+        linkedOk: 'המכשיר קושר — מסנכרן.',
         supabaseUrl: 'כתובת Supabase',
         anonKey: 'מפתח ציבורי (anon)',
         anonKeyHint: 'רק את המפתח הציבורי (anon) — לעולם לא מפתח service_role.',

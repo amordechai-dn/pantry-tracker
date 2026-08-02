@@ -23,28 +23,36 @@ app. Follow these steps once; then any number of devices can share one profile.
    and the device-linking functions.
 3. You should see "Success. No rows returned".
 
+> Already ran an older copy of this file? Just run it again — it's idempotent
+> (`create ... if not exists` / `create or replace`). The current version fixes
+> the device-link functions to find `digest()` in Supabase's `extensions`
+> schema, which the link tokens depend on.
+
 ## 4. Grab your credentials
 1. Go to **Project Settings → API**.
 2. Copy the **Project URL** (e.g. `https://abcd1234.supabase.co`).
 3. Copy the **anon / public** key (a long JWT). 
    - ⚠️ **Never** copy the `service_role` key — it must never touch the frontend.
 
-## 5. Paste credentials into HomeStock
-1. Open HomeStock → **Settings ⚙️ → Sync**.
-2. Tap **Backend settings**, paste the Project URL and anon key, and save.
-   - (Alternatively, fill `SUPABASE_URL` / `SUPABASE_ANON_KEY` in `config.js`
-     before deploying. Values entered in Settings override `config.js`.)
+## 5. Credentials are BAKED IN (zero-config per device)
+The project URL + anon (publishable) key are shipped in `config.js`, so **every
+device that opens HomeStock is already configured** — no manual entry. Settings
+→ Sync → **Advanced: backend settings** is an optional override only (prefilled
+from the baked values), and can be ignored for normal use.
 
-## 6. Link your devices
-- **First device:** in Settings → Sync tap **Enable sync on this device**. This
-  signs in anonymously, creates your household (cloud identity), and uploads your
-  existing local data.
-- **This device's link code** is now shown. To add another device:
-  1. On the **first device** tap **Link another device** to reveal a code + URL.
-  2. On the **new device**, first paste the same URL + anon key (step 5), then in
-     Settings → Sync choose **Link this device**, and paste the code (or open the
-     link URL). Both devices now share the same cloud profile.
-- **Regenerate token** invalidates all outstanding link codes.
+> To change the baked backend, edit `SUPABASE_URL` / `SUPABASE_ANON_KEY` in
+> `config.js` and redeploy. If they are blanked, the app just runs offline-first
+> with sync dormant.
+
+## 6. Link your devices (one tap / QR)
+- **First device:** Settings → Sync → **Enable sync on this device**. This signs
+  in anonymously, creates your household (cloud identity), and uploads local data.
+- **Add another device:**
+  1. On the first device tap **Link another device** — it shows a **QR code**, a
+     short code, and a deep-link URL.
+  2. On the new device, either **scan/open the QR or URL** (it auto-joins the same
+     household — no typing), or paste the short code into **Link this device**.
+- **Regenerate token** invalidates all outstanding link codes/QRs.
 
 ---
 
@@ -58,10 +66,14 @@ app. Follow these steps once; then any number of devices can share one profile.
   same name but different households stay completely separate.
 
 ## WHAT THE USER MUST DO (checklist)
+One-time backend setup (already done for this deployment — credentials are baked
+into `config.js`):
 - [ ] Create a Supabase project.
 - [ ] Enable **Anonymous sign-ins** in Authentication.
 - [ ] Run `sync/schema.sql` in the SQL Editor.
-- [ ] Copy **Project URL** + **anon/public** key from Settings → API.
-- [ ] In HomeStock: Settings → Sync → **Backend settings** → paste + save.
-- [ ] Tap **Enable sync on this device** on your main device.
-- [ ] On other devices: paste URL+key, then **Link this device** with the code/URL.
+- [ ] Put the **Project URL** + **anon/publishable** key into `config.js` and deploy.
+
+Per device (zero / one tap):
+- [ ] Just open HomeStock — it's already configured.
+- [ ] Main device: Settings → Sync → **Enable sync on this device**.
+- [ ] Other devices: **scan the QR / open the link** (auto-joins), or paste the code.
