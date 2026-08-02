@@ -1281,3 +1281,33 @@ body {
   color: var(--muted);
   margin-block-start: 8px;
 }
+
+/* Dev-only scanner debug panel (gated by ?debug=1 / localStorage flag). */
+.scan-debug {
+  margin-block-start: 10px;
+  border-block-start: 1px dashed rgba(255, 255, 255, 0.25);
+}
+.scan-debug-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-block: 6px 2px;
+}
+.scan-debug-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.scan-debug-label {
+  color: var(--muted);
+}
+.scan-debug-val {
+  font-weight: 700;
+  text-align: end;
+  direction: ltr;
+}

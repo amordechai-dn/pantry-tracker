@@ -299,6 +299,63 @@ async function rejects(name, fn) {
     ok(k + ' (en+he present, non-key)', en !== k && he !== k);
   });
 
+  // 18) Shared barcode lookup pipeline (camera + manual entry funnel here)
+  console.log('\n[scanner: ONE shared lookup pipeline]');
+  ok('lookupBarcode exposed as the single shared entry point', typeof AppI.lookupBarcode === 'function');
+  Auth.selectUser('aviraz'); DB.setUser(CurrentUser.id());
+
+  // (a) LOCAL hit via saved barcode mapping (per-user barcode store)
+  await DB.putBarcode({ barcode: '111LOCAL', name: 'Cached Cola', he: 'קולה', categoryId: 'drinks', unit: 'L', source: 'user' });
+  var rCache = await AppI.lookupBarcode('111LOCAL');
+  ok('local saved mapping -> source "cache"', rCache.source === 'cache' && rCache.product.name === 'Cached Cola');
+
+  // (b) OFF online hit (stubbed fetch; no image url so no canvas needed)
+  var offCalls = 0;
+  global.fetch = function () {
+    offCalls++;
+    return Promise.resolve({ ok: true, json: function () {
+      return Promise.resolve({ status: 1, product: {
+        product_name_en: 'Test Product', product_name_he: 'מוצר בדיקה',
+        brands: 'BrandX', categories_tags: ['en:beverages'], quantity: '1L',
+      }});
+    }});
+  };
+  navigator.onLine = true;
+  var rOff = await AppI.lookupBarcode('7290116537351'); // the reported barcode
+  ok('OFF online lookup -> source "off"', rOff.source === 'off' && rOff.product.name === 'Test Product');
+  ok('7290116537351 resolves through the shared pipeline', rOff.product.barcode === '7290116537351');
+  ok('OFF result is cached locally for next time', !!(await DB.getBarcode('7290116537351')));
+  var beforeCalls = offCalls;
+  var rAgain = await AppI.lookupBarcode('7290116537351');
+  ok('after first OFF hit -> "cache" with NO extra fetch', rAgain.source === 'cache' && offCalls === beforeCalls);
+
+  // (c) Online NOT FOUND -> create-new fallback, barcode prefilled
+  global.fetch = function () { return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ status: 0 }); } }); };
+  var rNew = await AppI.lookupBarcode('000NOTFOUND');
+  ok('online not-found -> source "new" (create fallback)', rNew.source === 'new');
+  ok('create fallback prefills the barcode', rNew.product.barcode === '000NOTFOUND');
+
+  // (d) OFFLINE -> offline new-product case (barcode prefilled, no fetch)
+  navigator.onLine = false;
+  var rOffline = await AppI.lookupBarcode('999OFFLINE');
+  ok('offline -> source "offline" (barcode prefilled)', rOffline.source === 'offline' && rOffline.product.barcode === '999OFFLINE');
+  navigator.onLine = true;
+
+  // Manual entry and camera single-scan both call AppI.lookupBarcode above and
+  // then the shared openBarcodeResult router, so identical barcodes yield
+  // identical routing. (DOM dialogs are covered by manual verification.)
+
+  // 19) New scanner/manual strings present in EN + HE
+  console.log('\n[scanner: i18n strings]');
+  ['scan.manualBarcode', 'scan.manualBarcodeTitle', 'scan.manualBarcodeLabel',
+   'scan.manualBarcodePlaceholder', 'scan.manualBarcodeSubmit',
+   'scan.debug.title', 'scan.debug.camera', 'scan.debug.formats',
+   'scan.debug.fps', 'scan.debug.last', 'scan.debug.attempts', 'scan.debug.status'].forEach(function (k) {
+    I18N.setLang('en'); var en = I18N.t(k);
+    I18N.setLang('he'); var he = I18N.t(k);
+    ok(k + ' (en+he present, non-key, distinct)', en !== k && he !== k && en !== he);
+  });
+
   console.log('\n============================');
   console.log('PASS ' + pass + '  FAIL ' + fail);
   console.log('============================');

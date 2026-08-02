@@ -1900,10 +1900,110 @@
     return localName(p) || t('scan.unknownName');
   }
 
+  // ---- Shared barcode lookup pipeline ----
+  // THE single source of truth used by BOTH camera detection (single + session)
+  // and manual barcode entry. Given a raw barcode, it resolves, in order:
+  //   1) an existing inventory item carrying that barcode        -> 'inventory'
+  //   2) the per-user saved barcode->product mapping / cache      -> 'cache'
+  //   3) an Open Food Facts online lookup (cached on success)     -> 'off'
+  //   4) otherwise a create-new-product fallback (barcode filled) -> 'new'
+  //      ('offline' is a distinct new-product case with no network)
+  // Never rejects; always resolves to a normalized { source, ... } descriptor.
+  function lookupBarcode(code) {
+    code = String(code || '').trim();
+    return resolveLocal(code).then(function (local) {
+      if (local && local.source === 'inventory')
+        return { source: 'inventory', item: local.item };
+      if (local && local.source === 'cache')
+        return { source: 'cache', product: local.product };
+      return lookupOFF(code).then(function (off) {
+        if (off && off.source === 'off') {
+          window.PantryDB.putBarcode(off); // cache for next time (any path)
+          return { source: 'off', product: off };
+        }
+        var blank = { barcode: code, categoryId: 'other', unit: 'pcs' };
+        if (off && off.offline) return { source: 'offline', product: blank };
+        // Online but not found, or the DB was unreachable -> create new.
+        return { source: 'new', product: blank, reason: off && off.error ? 'unreachable' : 'notfound' };
+      });
+    });
+  }
+
+  // Shared UI router: turn a lookupBarcode() result into the correct dialog.
+  // Identical for camera single-scan and manual entry, so both paths behave the
+  // same for the same barcode. onCancel/onSaved wire the calling flow.
+  function openBarcodeResult(res, code, onCancel, onSaved) {
+    if (res.source === 'inventory') { openAddUnits(res.item, onCancel, onSaved); return; }
+    if (res.source === 'cache') {
+      openBarcodeProduct({ barcode: code, product: res.product, hint: t('scan.fromCatalog') }, onCancel, onSaved);
+      return;
+    }
+    if (res.source === 'off') {
+      openBarcodeProduct({ barcode: code, product: res.product, hint: t('scan.fromOff') }, onCancel, onSaved);
+      return;
+    }
+    // offline / new (not found / unreachable) -> create new, barcode prefilled.
+    if (res.source === 'offline') showToast(t('scan.offline'));
+    else if (res.reason === 'unreachable') showToast(t('scan.offUnreachable'));
+    else showToast(t('scan.notFound'));
+    openBarcodeProduct({ barcode: code, product: res.product, isNew: true }, onCancel, onSaved);
+  }
+
+  // ---- Manual barcode entry (type or paste) ----
+  // Uses the SAME lookupBarcode + openBarcodeResult pipeline as the camera.
+  function openManualBarcode(handlers) {
+    handlers = handlers || {};
+    var overlay = h('div', { class: 'overlay center' });
+    function close() { overlay.remove(); }
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) { close(); if (handlers.onCancel) handlers.onCancel(); } });
+
+    var input = h('input', {
+      class: 'input',
+      type: 'text',
+      inputmode: 'numeric',
+      dir: 'ltr', // barcodes are always LTR digit strings, even in RTL UI
+      autocomplete: 'off',
+      placeholder: t('scan.manualBarcodePlaceholder'),
+      'aria-label': t('scan.manualBarcodeTitle'),
+    });
+    var status = h('div', { class: 'scan-status', text: '' });
+
+    function submit() {
+      var code = input.value.replace(/\s+/g, '').trim();
+      if (!code) { input.classList.add('error'); input.focus(); return; }
+      status.textContent = t('scan.looking');
+      lookupBarcode(code).then(function (res) {
+        close();
+        openBarcodeResult(res, code, handlers.onCancel, handlers.onSaved);
+      });
+    }
+    input.addEventListener('input', function () { input.classList.remove('error'); });
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+
+    var dialog = h(
+      'div',
+      { class: 'dialog' },
+      h('div', { class: 'sheet-header' },
+        h('h2', { class: 'dialog-title', text: t('scan.manualBarcodeTitle') }),
+        h('button', { class: 'sheet-close', 'aria-label': t('a11y.close'), onclick: function () { close(); if (handlers.onCancel) handlers.onCancel(); } }, '✕')
+      ),
+      h('label', { class: 'field-label', text: t('scan.manualBarcodeLabel') }),
+      input,
+      status,
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn cancel', type: 'button', onclick: function () { close(); if (handlers.onCancel) handlers.onCancel(); } }, t('form.cancel')),
+        h('button', { class: 'btn save', type: 'button', onclick: submit }, t('scan.manualBarcodeSubmit'))
+      )
+    );
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    setTimeout(function () { input.focus(); }, 50);
+  }
+
   function openScanner() {
-    // No camera support → straight to manual entry (no need to load ZXing).
+    // No camera support → manual barcode entry (no need to load ZXing).
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      openForm(null, { prefill: {} });
+      openManualBarcode({ onSaved: function () { refresh(); } });
       return;
     }
     // Lazy-load the scanner library on first open, showing a small loading
@@ -1937,7 +2037,7 @@
         if (loader.parentNode) loader.remove();
         if (aborted) return;
         showToast(t('scan.loadError'));
-        openForm(null, { prefill: {} });
+        openManualBarcode({ onSaved: function () { refresh(); } });
       });
   }
 
@@ -1950,8 +2050,31 @@
     var lastCode = null;
     var lastTime = 0;
     var closed = false;
-    var reader = new ZXing.BrowserMultiFormatReader();
+
+    // Restrict to the 1D retail product symbologies (much more robust than
+    // "try every format") and enable TRY_HARDER so slightly rotated / lower
+    // quality codes still decode. This is the key fix for real EAN-13 codes
+    // like 7290116537351 that failed under the default (all-format, no
+    // try-harder, 2 fps) configuration.
+    var SCAN_FORMATS = [
+      ZXing.BarcodeFormat.EAN_13,
+      ZXing.BarcodeFormat.UPC_A,
+      ZXing.BarcodeFormat.UPC_E,
+      ZXing.BarcodeFormat.EAN_8,
+    ];
+    var hints = new Map();
+    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, SCAN_FORMATS);
+    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    // 2nd arg = ms between decode attempts. 80ms ≈ 12 attempts/sec (was 500 =
+    // 2/sec), so a code in view is found far faster.
+    var reader = new ZXing.BrowserMultiFormatReader(hints, 80);
     var controls = null;
+
+    // Dev-only debug telemetry (see maybeAttachDebug). Cheap counters kept
+    // regardless; the panel is only rendered when the debug flag is on.
+    var dbg = { attempts: 0, lastAttempts: 0, fps: 0, lastCode: '-', w: 0, h: 0 };
+    var dbgTimer = null;
+    var dbgEls = null;
 
     var overlay = h('div', { class: 'overlay scanner center' });
     var video = h('video', { class: 'scan-video' });
@@ -1980,14 +2103,19 @@
       { class: 'btn save', type: 'button', onclick: commitSession },
       t('scan.addAll', { count: 0 })
     );
+    // Secondary action: type/paste a barcode. Pauses the live camera decode
+    // while the dialog is open, then runs the SAME shared lookup pipeline.
     var manualBtn = h(
       'button',
       {
         class: 'btn cancel',
         type: 'button',
-        onclick: function () { close(); openForm(null, { prefill: {} }); },
+        onclick: function () {
+          stop();
+          openManualBarcode({ onCancel: resume, onSaved: closeSaved });
+        },
       },
-      t('scan.manual')
+      t('scan.manualBarcode')
     );
     var cancelBtn = h(
       'button',
@@ -2011,9 +2139,51 @@
       try { if (controls) controls.stop(); } catch (e) {}
       try { if (reader.reset) reader.reset(); } catch (e) {}
     }
+
+    // ---- Dev-only debug panel ----
+    // Enabled via localStorage 'pantry.debug'==='1' or a ?debug=1 URL param.
+    // Surfaces camera resolution, active decoder formats, live FPS (decode
+    // attempts/sec), the last detected barcode, total attempts, and status.
+    function debugOn() {
+      try {
+        return localStorage.getItem('pantry.debug') === '1' ||
+          /[?&]debug=1/.test(location.search || '');
+      } catch (e) { return false; }
+    }
+    function maybeAttachDebug() {
+      if (!debugOn()) return;
+      function row(label) {
+        var val = h('span', { class: 'scan-debug-val', text: '-' });
+        panel.appendChild(h('div', { class: 'scan-debug-row' },
+          h('span', { class: 'scan-debug-label', text: label }), val));
+        return val;
+      }
+      var box = h('div', { class: 'scan-debug' });
+      panel.appendChild(box);
+      panel.appendChild(h('div', { class: 'scan-debug-title', text: t('scan.debug.title') }));
+      dbgEls = {
+        camera: row(t('scan.debug.camera')),
+        formats: row(t('scan.debug.formats')),
+        fps: row(t('scan.debug.fps')),
+        last: row(t('scan.debug.last')),
+        attempts: row(t('scan.debug.attempts')),
+        status: row(t('scan.debug.status')),
+      };
+      dbgEls.formats.textContent = 'EAN-13, UPC-A, UPC-E, EAN-8';
+      dbgTimer = setInterval(function () {
+        dbg.fps = dbg.attempts - dbg.lastAttempts; // updated once/sec
+        dbg.lastAttempts = dbg.attempts;
+        dbgEls.camera.textContent = dbg.w && dbg.h ? dbg.w + '×' + dbg.h : '-';
+        dbgEls.fps.textContent = String(dbg.fps);
+        dbgEls.last.textContent = dbg.lastCode;
+        dbgEls.attempts.textContent = String(dbg.attempts);
+        dbgEls.status.textContent = (status.textContent || '').slice(0, 40);
+      }, 1000);
+    }
     function close() {
       if (closed) return;
       closed = true;
+      if (dbgTimer) { clearInterval(dbgTimer); dbgTimer = null; }
       stop();
       overlay.remove();
     }
@@ -2023,14 +2193,46 @@
     }
     function hit() { flash(); scanFeedback(); }
 
+    // Best-effort post-start camera tuning: continuous autofocus (where the
+    // device/browser exposes it) and reading back the actual resolution for the
+    // debug panel. Unsupported constraints are silently ignored — never fatal.
+    function applyAdvancedCamera() {
+      try {
+        var stream = video.srcObject;
+        var track = stream && stream.getVideoTracks && stream.getVideoTracks()[0];
+        if (!track) return;
+        var caps = track.getCapabilities ? track.getCapabilities() : {};
+        var adv = [];
+        if (caps.focusMode && caps.focusMode.indexOf('continuous') !== -1)
+          adv.push({ focusMode: 'continuous' });
+        if (adv.length && track.applyConstraints)
+          track.applyConstraints({ advanced: adv }).catch(function () {});
+        var s = track.getSettings ? track.getSettings() : {};
+        dbg.w = s.width || 0;
+        dbg.h = s.height || 0;
+      } catch (e) {}
+    }
+
     function startDecode() {
+      // Request the REAR camera at the highest practical resolution. `ideal`
+      // keeps it best-effort so devices that can't hit 1080p still start.
+      var constraints = {
+        audio: false,
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
+      };
       reader
-        .decodeFromConstraints(
-          { video: { facingMode: { ideal: 'environment' } } },
-          video,
-          function (result) { if (result) onCode(result.getText()); }
-        )
-        .then(function (c) { controls = c; })
+        .decodeFromConstraints(constraints, video, function (result) {
+          dbg.attempts++; // counts every decode attempt (found or not)
+          if (result) { dbg.lastCode = result.getText(); onCode(result.getText()); }
+        })
+        .then(function (c) {
+          controls = c;
+          applyAdvancedCamera();
+        })
         .catch(function () {
           status.textContent = t('scan.denied');
           status.classList.add('error');
@@ -2105,10 +2307,13 @@
       renderSession();
     }
 
+    // Continuous-mode: resolve via the shared pipeline, then add to the batch
+    // session (rather than opening a dialog).
     function resolveForSession(code) {
-      resolveLocal(code).then(function (local) {
-        if (local && local.source === 'inventory') {
-          var it = local.item;
+      status.textContent = t('scan.looking');
+      lookupBarcode(code).then(function (res) {
+        if (res.source === 'inventory') {
+          var it = res.item;
           addToSession({
             barcode: code, name: it.nameEn || it.name || '', he: it.nameHe || '',
             image: thumbImageFor(it), emoji: it.emoji,
@@ -2116,55 +2321,23 @@
           });
           return;
         }
-        if (local && local.source === 'cache') {
-          addToSession(local.product);
+        if (res.source === 'cache' || res.source === 'off') {
+          addToSession(res.product);
           return;
         }
-        status.textContent = t('scan.looking');
-        lookupOFF(code).then(function (off) {
-          if (off && off.source === 'off') {
-            window.PantryDB.putBarcode(off);
-            addToSession(off);
-          } else {
-            if (off && off.offline) status.textContent = t('scan.offline');
-            // Unknown/unreachable → placeholder entry; editable later in inventory.
-            addToSession({ barcode: code, name: '', categoryId: 'other', unit: 'pcs' });
-          }
-        });
+        if (res.source === 'offline') status.textContent = t('scan.offline');
+        // Unknown/unreachable → placeholder entry; editable later in inventory.
+        addToSession({ barcode: code, name: '', categoryId: 'other', unit: 'pcs' });
       });
     }
 
+    // Single-scan: resolve via the shared pipeline, then route to the same
+    // dialogs that manual entry uses. resume() re-arms the camera on cancel;
+    // closeSaved() closes the scanner + refreshes on success.
     function handleSingle(code) {
-      resolveLocal(code).then(function (local) {
-        if (local && local.source === 'inventory') {
-          hit();
-          openAddUnits(local.item, resume, closeSaved);
-          return;
-        }
-        if (local && local.source === 'cache') {
-          hit();
-          openBarcodeProduct(
-            { barcode: code, product: local.product, hint: t('scan.fromCatalog') },
-            resume, closeSaved
-          );
-          return;
-        }
-        lookupOFF(code).then(function (off) {
-          hit();
-          if (off && off.source === 'off') {
-            window.PantryDB.putBarcode(off);
-            openBarcodeProduct(
-              { barcode: code, product: off, hint: t('scan.fromOff') },
-              resume, closeSaved
-            );
-          } else {
-            showToast(off && off.offline ? t('scan.offline') : t('scan.offUnreachable'));
-            openBarcodeProduct(
-              { barcode: code, product: { barcode: code, categoryId: 'other', unit: 'pcs' }, isNew: true },
-              resume, closeSaved
-            );
-          }
-        });
+      lookupBarcode(code).then(function (res) {
+        hit();
+        openBarcodeResult(res, code, resume, closeSaved);
       });
     }
 
@@ -2230,6 +2403,7 @@
     }
 
     renderSession();
+    maybeAttachDebug();
     startDecode();
   }
 
@@ -2824,6 +2998,8 @@
       detectLang: detectLang,
       resolveNames: resolveNames,
       localName: localName,
+      // THE single shared barcode lookup used by camera + manual entry.
+      lookupBarcode: lookupBarcode,
     },
   };
 })();
