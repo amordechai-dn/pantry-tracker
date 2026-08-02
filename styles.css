@@ -2,14 +2,14 @@
    Uses CSS logical properties so layouts flip correctly under dir="rtl". */
 
 :root {
-  --bg: #f4f6f5;
+  --bg: #eef4fb;
   --card: #ffffff;
-  --primary: #2e9e6b;
-  --primary-dark: #1f7a50;
-  --primary-soft: #e4f4ec;
-  --text: #16211c;
-  --muted: #6b7770;
-  --border: #e7ece9;
+  --primary: #1877d1;
+  --primary-dark: #1160ac;
+  --primary-soft: #e3eefb;
+  --text: #14202b;
+  --muted: #5f7180;
+  --border: #e2ebf4;
   --danger: #e5484d;
   --danger-soft: #fde8e8;
   --white: #ffffff;
@@ -17,8 +17,8 @@
   --radius-md: 12px;
   --radius-lg: 16px;
   --radius-xl: 24px;
-  --shadow-card: 0 4px 12px rgba(11, 35, 26, 0.06);
-  --shadow-fab: 0 6px 16px rgba(11, 35, 26, 0.28);
+  --shadow-card: 0 4px 12px rgba(15, 40, 70, 0.07);
+  --shadow-fab: 0 6px 16px rgba(15, 40, 70, 0.28);
 }
 
 * {
@@ -79,6 +79,27 @@ body {
   flex-direction: column;
   align-items: flex-end;
   gap: 4px;
+}
+.header-btn-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.icon-btn {
+  width: 38px;
+  height: 38px;
+  border-radius: 999px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.icon-btn:active {
+  opacity: 0.7;
 }
 .lang-btn {
   display: inline-flex;
@@ -187,6 +208,22 @@ body {
   font-size: 11px;
   font-weight: 700;
 }
+.target-pill {
+  background: var(--primary-soft);
+  color: var(--primary-dark);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.restock-card {
+  border: 1px solid var(--primary-soft);
+}
+.step-btn.big {
+  width: 40px;
+  height: 40px;
+  font-size: 24px;
+}
 
 /* ---- Stepper ---- */
 .stepper {
@@ -286,6 +323,17 @@ body {
 .fab:active {
   transform: scale(0.96);
   opacity: 0.9;
+}
+.fab.scan {
+  width: 52px;
+  height: 52px;
+  font-size: 24px;
+  background: var(--card);
+  color: var(--primary-dark);
+  border: 1px solid var(--border);
+  inset-inline-end: 24px;
+  inset-block-end: calc(env(safe-area-inset-bottom, 0px) + 96px);
+  box-shadow: var(--shadow-card);
 }
 
 /* ---- Overlays / modals ---- */
@@ -554,4 +602,155 @@ body {
   font-size: 18px;
   font-weight: 800;
   color: var(--primary);
+}
+
+/* ---- Scanner ---- */
+.scan-panel {
+  width: 100%;
+  max-width: 360px;
+  background: var(--bg);
+  border-radius: var(--radius-xl);
+  padding: 16px;
+}
+.scan-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  background: #000;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.scan-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.scan-reticle {
+  position: absolute;
+  inset: 18% 12%;
+  border: 3px solid rgba(255, 255, 255, 0.9);
+  border-radius: 12px;
+  box-shadow: 0 0 0 2000px rgba(0, 0, 0, 0.25);
+}
+.scan-status {
+  text-align: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 12px 0;
+}
+.scan-status.error {
+  color: var(--danger);
+}
+
+/* ---- Toast ---- */
+.toast {
+  position: fixed;
+  inset-block-end: calc(env(safe-area-inset-bottom, 0px) + 24px);
+  inset-inline: 16px;
+  max-width: 420px;
+  margin: 0 auto;
+  background: var(--text);
+  color: #fff;
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 14px;
+  font-weight: 600;
+  box-shadow: var(--shadow-fab);
+  z-index: 80;
+  animation: slideUp 0.2s ease-out;
+}
+.toast-undo {
+  background: none;
+  border: none;
+  color: #8ec5ff;
+  font-weight: 800;
+  font-size: 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* ---- Monthly view ---- */
+.monthly-dialog {
+  max-width: 400px;
+}
+.month-select {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  font-size: 16px;
+  font-family: inherit;
+  color: var(--text);
+}
+.monthly-content {
+  margin-block-start: 12px;
+}
+.stat-row {
+  display: flex;
+  gap: 12px;
+}
+.stat {
+  flex: 1;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 14px;
+  text-align: center;
+}
+.stat-num {
+  font-size: 26px;
+  font-weight: 800;
+  color: var(--primary-dark);
+}
+.stat-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+  margin-block-start: 2px;
+}
+.monthly-needs-title {
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--muted);
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  margin-block: 16px 8px;
+}
+.monthly-empty {
+  color: var(--muted);
+  font-size: 15px;
+  font-weight: 500;
+  padding: 8px 0;
+}
+.monthly-list {
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.monthly-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  margin-block-end: 8px;
+}
+.monthly-item-name {
+  font-weight: 700;
+  color: var(--text);
+}
+.monthly-item-miss {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  text-align: end;
 }

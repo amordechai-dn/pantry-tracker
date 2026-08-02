@@ -52,8 +52,9 @@ function encodePng(width, height, rgba) {
 }
 
 // ---- Drawing ----
-const GREEN = [46, 158, 107]; // #2E9E6B
-const GREEN_DARK = [31, 122, 80]; // #1F7A50
+// Light-blue theme (matches CSS --primary / --primary-dark).
+const GREEN = [24, 119, 209]; // #1877D1 (primary blue, AA vs white)
+const GREEN_DARK = [17, 96, 172]; // #1160AC
 const WHITE = [255, 255, 255];
 
 function mix(a, b, t) {

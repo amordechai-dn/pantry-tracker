@@ -94,7 +94,10 @@
       categoryId: input.categoryId || 'other',
       location: input.location || 'Fridge',
       note: input.note || null,
-      // Reserved for future features (not surfaced in the MVP UI):
+      // Desired amount / par level (target stock). 0 = not tracked.
+      desiredAmount:
+        typeof input.desiredAmount === 'number' ? input.desiredAmount : 0,
+      // Reserved for future features:
       expiryDate: input.expiryDate || null,
       lowStockThreshold:
         typeof input.lowStockThreshold === 'number'
@@ -156,10 +159,30 @@
     });
   }
 
+  // ---- Monthly restock log (on-device, keyed by YYYY-MM) ----
+  // Kept in localStorage as a small JSON blob:
+  //   { "2026-08": { restocked: n, consumed: n, shortfall: [ {name,missing,have,target} ] } }
+  var MONTHLY_KEY = 'pantry.monthly.v1';
+
+  function getMonthlyLog() {
+    try {
+      return JSON.parse(localStorage.getItem(MONTHLY_KEY) || '{}') || {};
+    } catch (e) {
+      return {};
+    }
+  }
+  function setMonthlyLog(obj) {
+    try {
+      localStorage.setItem(MONTHLY_KEY, JSON.stringify(obj || {}));
+    } catch (e) {}
+  }
+
   window.PantryDB = {
     getAll: getAll,
     create: create,
     put: put,
     remove: remove,
+    getMonthlyLog: getMonthlyLog,
+    setMonthlyLog: setMonthlyLog,
   };
 })();
