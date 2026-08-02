@@ -1,6 +1,6 @@
 /* Service worker: precache + cache-first, offline-capable, self-updating.
    Bump VERSION on every deploy to trigger an update for installed PWAs. */
-var VERSION = 'v1.1.0';
+var VERSION = 'v1.2.0';
 var CACHE = 'pantry-' + VERSION;
 
 var ASSETS = [
@@ -12,6 +12,7 @@ var ASSETS = [
   './app.js',
   './pwa.js',
   './vendor/zxing.min.js',
+  './data/foods.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',

@@ -32,6 +32,57 @@
     return '🍽️';
   }
 
+  // Emoji shown for an item: its specific emoji, else its category emoji.
+  function itemEmoji(item) {
+    return item.emoji || categoryEmoji(item.categoryId);
+  }
+
+  // ---- Local food database (autocomplete + emoji assignment) ----
+  var FOODS = window.FOODS || [];
+
+  function foodLabel(f) {
+    return window.I18N.getLang() === 'he' && f.he ? f.he : f.name;
+  }
+
+  // Ranked matches for the autocomplete dropdown (searches EN + HE).
+  function foodSearch(query) {
+    var q = (query || '').trim().toLowerCase();
+    if (!q) return [];
+    var res = [];
+    for (var i = 0; i < FOODS.length; i++) {
+      var f = FOODS[i];
+      var en = f.name.toLowerCase();
+      var he = (f.he || '').toLowerCase();
+      var score = -1;
+      if (en === q || he === q) score = 0;
+      else if (en.indexOf(q) === 0 || (he && he.indexOf(q) === 0)) score = 1;
+      else if (en.indexOf(q) !== -1 || (he && he.indexOf(q) !== -1)) score = 2;
+      if (score >= 0) res.push({ f: f, score: score });
+    }
+    res.sort(function (a, b) {
+      return a.score - b.score || a.f.name.localeCompare(b.f.name);
+    });
+    return res.slice(0, 8).map(function (r) {
+      return r.f;
+    });
+  }
+
+  // Best-effort exact/prefix match used to auto-assign an emoji on save.
+  function foodMatch(name) {
+    var q = (name || '').trim().toLowerCase();
+    if (!q) return null;
+    var prefix = null;
+    for (var i = 0; i < FOODS.length; i++) {
+      var f = FOODS[i];
+      var en = f.name.toLowerCase();
+      var he = (f.he || '').toLowerCase();
+      if (en === q || he === q) return f;
+      if (!prefix && (en.indexOf(q) === 0 || (he && he.indexOf(q) === 0)))
+        prefix = f;
+    }
+    return prefix;
+  }
+
   // Map Open Food Facts category tags to our category ids.
   function deriveCategory(tags) {
     var s = (tags || []).join(' ').toLowerCase();
@@ -354,7 +405,7 @@
           openForm(item);
         },
       },
-      h('div', { class: 'badge', text: categoryEmoji(item.categoryId) }),
+      h('div', { class: 'badge', text: itemEmoji(item) }),
       h(
         'div',
         { class: 'card-info' },
@@ -374,7 +425,7 @@
           openForm(item);
         },
       },
-      h('div', { class: 'badge', text: categoryEmoji(item.categoryId) }),
+      h('div', { class: 'badge', text: itemEmoji(item) }),
       h(
         'div',
         { class: 'card-info' },
@@ -435,6 +486,7 @@
       note: editing ? existing.note || '' : '',
       desiredAmount: editing ? existing.desiredAmount || 0 : 0,
       barcode: editing ? existing.barcode || null : prefill.barcode || null,
+      emoji: editing ? existing.emoji || null : prefill.emoji || null,
     };
 
     var overlay = h('div', { class: 'overlay' });
@@ -462,15 +514,118 @@
 
     var body = h('div', { class: 'sheet-body' });
 
-    // Name
+    // Name + autocomplete
     var nameInput = h('input', {
       class: 'input',
       type: 'text',
       value: state.name,
       placeholder: t('form.namePlaceholder'),
+      autocomplete: 'off',
+      autocorrect: 'off',
+      autocapitalize: 'off',
+      spellcheck: 'false',
     });
+    var acBox = h('div', { class: 'ac-box', style: 'display:none' });
+    var suggestions = [];
+    var activeIdx = -1;
+
+    // Applies a chosen food: fills name, emoji, and category.
+    function applyFood(f) {
+      nameInput.value = foodLabel(f);
+      state.name = nameInput.value;
+      state.emoji = f.emoji || null;
+      if (f.category) {
+        state.categoryId = f.category;
+        Array.prototype.forEach.call(chips.children, function (c, idx) {
+          c.className =
+            'chip' + (CATEGORIES[idx].id === f.category ? ' active' : '');
+        });
+      }
+      closeAc();
+    }
+
+    function closeAc() {
+      suggestions = [];
+      activeIdx = -1;
+      acBox.style.display = 'none';
+      acBox.innerHTML = '';
+    }
+
+    function renderAc() {
+      acBox.innerHTML = '';
+      var q = nameInput.value.trim();
+      if (!q) {
+        acBox.style.display = 'none';
+        return;
+      }
+      suggestions = foodSearch(q);
+      if (!suggestions.length) {
+        // Only show a "no matches" hint once the query is meaningful.
+        if (q.length >= 2) {
+          acBox.style.display = 'block';
+          acBox.appendChild(h('div', { class: 'ac-none', text: t('autocomplete.none') }));
+        } else {
+          acBox.style.display = 'none';
+        }
+        return;
+      }
+      acBox.style.display = 'block';
+      acBox.appendChild(
+        h('div', { class: 'ac-head', text: t('autocomplete.suggestions') })
+      );
+      suggestions.forEach(function (f, idx) {
+        acBox.appendChild(
+          h(
+            'div',
+            {
+              class: 'ac-item' + (idx === activeIdx ? ' active' : ''),
+              // Use mousedown/touchstart so it fires before input blur.
+              onmousedown: function (e) {
+                e.preventDefault();
+                applyFood(f);
+              },
+            },
+            h('span', { class: 'ac-emoji', text: f.emoji }),
+            h('span', { class: 'ac-name', text: foodLabel(f) })
+          )
+        );
+      });
+    }
+
+    var acTimer;
+    nameInput.addEventListener('input', function () {
+      state.name = nameInput.value;
+      state.emoji = null; // typing invalidates a previously chosen emoji
+      nameInput.classList.remove('error');
+      clearTimeout(acTimer);
+      acTimer = setTimeout(renderAc, 120);
+    });
+    nameInput.addEventListener('keydown', function (e) {
+      if (acBox.style.display === 'none' || !suggestions.length) return;
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        activeIdx = (activeIdx + 1) % suggestions.length;
+        renderAc();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        activeIdx = (activeIdx - 1 + suggestions.length) % suggestions.length;
+        renderAc();
+      } else if (e.key === 'Enter') {
+        if (activeIdx >= 0) {
+          e.preventDefault();
+          applyFood(suggestions[activeIdx]);
+        }
+      } else if (e.key === 'Escape') {
+        closeAc();
+      }
+    });
+    nameInput.addEventListener('blur', function () {
+      setTimeout(closeAc, 150);
+    });
+
     body.appendChild(h('label', { class: 'field-label', text: t('form.name') }));
     body.appendChild(nameInput);
+    body.appendChild(acBox);
 
     // Location segmented
     body.appendChild(
@@ -667,6 +822,16 @@
         nameInput.classList.add('error');
         return;
       }
+      // Best-effort emoji when the user didn't pick a suggestion.
+      var emoji = state.emoji;
+      if (!emoji) {
+        var m = foodMatch(name);
+        if (m) {
+          emoji = m.emoji;
+          if (state.categoryId === 'other' && m.category)
+            state.categoryId = m.category;
+        }
+      }
       var payload = {
         name: name,
         quantity: state.quantity,
@@ -676,6 +841,7 @@
         note: noteInput.value.trim() || null,
         desiredAmount: state.desiredAmount,
         barcode: state.barcode,
+        emoji: emoji || null,
       };
       var p;
       if (editing) {
@@ -1078,6 +1244,8 @@
           p && (p.product_name || p.product_name_en || p.generic_name);
         if (d && d.status === 1 && name && name.trim()) {
           var cat = deriveCategory(p.categories_tags);
+          var fm = foodMatch(name);
+          if (fm && cat === 'other' && fm.category) cat = fm.category;
           window.PantryDB.create({
             name: name.trim(),
             quantity: 1,
@@ -1085,6 +1253,7 @@
             categoryId: cat,
             location: 'Pantry',
             barcode: code,
+            emoji: fm ? fm.emoji : null,
           }).then(function (item) {
             recordDelta(item.quantity);
             ctx.close();

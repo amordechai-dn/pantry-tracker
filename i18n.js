@@ -67,6 +67,10 @@
         cancel: 'Cancel',
         confirm: 'Delete',
       },
+      autocomplete: {
+        suggestions: 'Suggestions',
+        none: 'No matches',
+      },
       restock: {
         title: 'To restock',
         missing: '{{missing}} missing (have {{have}} of {{target}})',
@@ -162,6 +166,10 @@
         message: 'להסיר את ״{{name}}״ מהמזווה?',
         cancel: 'ביטול',
         confirm: 'מחיקה',
+      },
+      autocomplete: {
+        suggestions: 'הצעות',
+        none: 'אין התאמות',
       },
       restock: {
         title: 'רשימת קניות',
