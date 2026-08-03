@@ -625,7 +625,18 @@
 
   // ---- State ----
   var items = [];
+  // Shopping List — a SEPARATE model (shopping_list_items), NOT derived from
+  // inventory. Held in its own in-memory array and persisted via PantryDB
+  // shopping CRUD. Inventory (`items`) and this list never share write paths.
+  var shoppingItems = [];
   var root;
+
+  // True only in a real browser DOM. Lets data-layer actions (add/purchase/
+  // remove shopping) run in a headless test harness without a DOM by making
+  // the UI-refresh calls safely no-op.
+  function hasDOM() {
+    return typeof document !== 'undefined' && typeof document.getElementById === 'function';
+  }
 
   function load() {
     return window.PantryDB.getAll()
@@ -636,6 +647,13 @@
           if (typeof i.image === 'undefined') i.image = null; // migrate legacy
           return i;
         });
+      })
+      .then(function () {
+        // Load this user's Shopping List (independent store, per-user scoped).
+        return window.PantryDB.getAllShopping();
+      })
+      .then(function (shop) {
+        shoppingItems = shop || [];
       })
       .then(function () {
         // Hydrate the in-memory image cache so cards render synchronously.
@@ -707,8 +725,11 @@
   var cardRefs = {};
 
   // ---- Responsive layout / shared Shopping List ----
-  // The "To restock" list (items below their target) IS the Shopping List. It
-  // is rendered by ONE shared renderer (renderShoppingList) used in two modes:
+  // The Shopping List is its OWN editable model (shoppingItems, backed by the
+  // PantryDB `shopping` store) — NOT derived from inventory. The inventory
+  // "To restock" (computeShortfall) is surfaced only as optional SUGGESTIONS
+  // with an explicit "add to shopping list" action. It is rendered by ONE
+  // shared renderer (renderShoppingList) used in two modes:
   //   - 'sidebar' : desktop side panel next to inventory (>= BREAKPOINT)
   //   - 'page'    : mobile dedicated full-width page (< BREAKPOINT)
   // Only one instance is ever mounted at a time (tracked by shoppingListEl).
@@ -742,20 +763,165 @@
     } catch (e) {}
   }
 
-  // THE single shared Shopping List renderer (both sidebar + page modes).
+  // ---- Shopping List model helpers (independent of inventory) ----
+  // Normalized identity used to (a) coalesce duplicate shopping entries and
+  // (b) match a purchased shopping item to an inventory item. Never writes.
+  function normName(s) {
+    return String(s == null ? '' : s).trim().toLowerCase().replace(/\s+/g, ' ');
+  }
+  function shopKey(rec) {
+    return normName((rec && (rec.nameEn || rec.name || rec.nameHe)) || '');
+  }
+  function activeShopping() {
+    return shoppingItems.filter(function (x) { return !x.purchased; });
+  }
+  function findActiveShoppingByKey(key) {
+    for (var i = 0; i < shoppingItems.length; i++) {
+      if (!shoppingItems[i].purchased && shopKey(shoppingItems[i]) === key) return shoppingItems[i];
+    }
+    return null;
+  }
+  function findInventoryByKey(key) {
+    for (var i = 0; i < items.length; i++) {
+      if (shopKey(items[i]) === key) return items[i];
+    }
+    return null;
+  }
+  function upsertLocalShopping(rec) {
+    var idx = shoppingItems.findIndex(function (x) { return x.id === rec.id; });
+    if (idx >= 0) shoppingItems[idx] = rec; else shoppingItems.push(rec);
+  }
+
+  // Re-render the mounted Shopping List (sidebar or page) without touching data.
+  function refreshShopping() {
+    if (shoppingListEl && shoppingListEl.parentNode) {
+      renderShoppingList(shoppingListEl, shoppingListMode);
+    } else {
+      renderCurrentView();
+    }
+  }
+
+  // ADD TO SHOPPING LIST — writes ONLY to the shopping store. Never creates or
+  // modifies an inventory item. Adding an existing (active) entry bumps its
+  // needed quantity instead of duplicating.
+  function addToShoppingList(input) {
+    input = input || {};
+    var qty = typeof input.quantity === 'number' && input.quantity > 0 ? input.quantity : 1;
+    var key = normName(input.nameEn || input.name || input.nameHe || '');
+    var existing = key ? findActiveShoppingByKey(key) : null;
+    var rec;
+    if (existing) {
+      existing.quantity = (typeof existing.quantity === 'number' ? existing.quantity : 0) + qty;
+      rec = existing;
+    } else {
+      rec = {
+        name: (input.name || '').trim() || null,
+        nameEn: (input.nameEn || '').trim() || null,
+        nameHe: (input.nameHe || '').trim() || null,
+        quantity: qty,
+        unit: input.unit || 'pcs',
+        categoryId: input.categoryId || 'other',
+        note: input.note || null,
+        purchased: false,
+      };
+    }
+    return window.PantryDB.putShopping(rec).then(function (saved) {
+      upsertLocalShopping(saved);
+      recomputeShortfall();
+      refreshShopping();
+      showToast(t('shopping.addedToList'));
+      return saved;
+    });
+  }
+
+  // Adjust a shopping item's NEEDED quantity (edits the shopping model only).
+  function changeShoppingQty(shop, delta) {
+    var next = (typeof shop.quantity === 'number' ? shop.quantity : 1) + delta;
+    if (next < 1) next = 1;
+    shop.quantity = next;
+    window.PantryDB.putShopping(shop).then(function (saved) {
+      upsertLocalShopping(saved);
+      refreshShopping();
+    });
+  }
+
+  // PURCHASE FLOW — the ONLY place the Shopping List affects inventory. Adds the
+  // needed quantity to the matching inventory item (creating it if none exists),
+  // then removes the shopping entry. Reversible via undo.
+  function purchaseShoppingItem(shop) {
+    var qty = typeof shop.quantity === 'number' && shop.quantity > 0 ? shop.quantity : 1;
+    var key = shopKey(shop);
+    var inv = key ? findInventoryByKey(key) : null;
+    var createdNew = false;
+    var prevQty = inv ? inv.quantity : 0;
+    var applyInv;
+    if (inv) {
+      inv.quantity = (typeof inv.quantity === 'number' ? inv.quantity : 0) + qty;
+      applyInv = window.PantryDB.put(inv).then(function () { return inv; });
+    } else {
+      applyInv = window.PantryDB.create({
+        name: shop.name, nameEn: shop.nameEn, nameHe: shop.nameHe,
+        quantity: qty, unit: shop.unit || 'pcs', categoryId: shop.categoryId || 'other',
+      }).then(function (ni) { createdNew = true; items.push(ni); return ni; });
+    }
+    return applyInv.then(function (invItem) {
+      recordDelta(qty);
+      return window.PantryDB.removeShopping(shop.id).then(function () {
+        shoppingItems = shoppingItems.filter(function (x) { return x.id !== shop.id; });
+        recomputeShortfall();
+        refreshAfterMutation(invItem);
+        showToast(t('shopping.purchased'), function () {
+          var revert;
+          if (createdNew) {
+            revert = window.PantryDB.remove(invItem.id).then(function () {
+              items = items.filter(function (x) { return x.id !== invItem.id; });
+            });
+          } else {
+            invItem.quantity = prevQty;
+            revert = window.PantryDB.put(invItem);
+          }
+          revert.then(function () {
+            recordDelta(-qty);
+            return window.PantryDB.putShopping(shop);
+          }).then(function (saved) {
+            upsertLocalShopping(saved);
+            recomputeShortfall();
+            refreshAfterMutation(invItem);
+          });
+        });
+      });
+    });
+  }
+
+  // Remove a shopping entry (does NOT touch inventory). Reversible via undo.
+  function removeShoppingItem(shop) {
+    return window.PantryDB.removeShopping(shop.id).then(function () {
+      shoppingItems = shoppingItems.filter(function (x) { return x.id !== shop.id; });
+      refreshShopping();
+      showToast(t('shopping.removed'), function () {
+        window.PantryDB.putShopping(shop).then(function (saved) {
+          upsertLocalShopping(saved);
+          refreshShopping();
+        });
+      });
+    });
+  }
+
+  // THE single shared Shopping List renderer (both sidebar + page modes). Backed
+  // by the separate shopping model; inventory shortfall is shown as suggestions.
   function renderShoppingList(container, mode) {
     shoppingListEl = container;
     shoppingListMode = mode;
     container.innerHTML = '';
     var collapsed = mode === 'sidebar' && shopCollapsed();
-    var shortfall = computeShortfall();
+    var active = activeShopping();
 
     var head = h(
       'div',
       { class: 'shopping-head' },
       h('span', { class: 'shopping-emoji', 'aria-hidden': 'true', text: '🛒' }),
       h('h2', { class: 'shopping-title', text: t('shopping.title') }),
-      h('span', { class: 'section-count', text: String(shortfall.length) })
+      h('span', { class: 'section-count', text: String(active.length) })
     );
     if (mode === 'sidebar') {
       head.appendChild(
@@ -780,113 +946,199 @@
     container.appendChild(head);
     if (collapsed) return; // header-only when collapsed
 
-    // Add-item control — reuses the existing add form (no second implementation).
+    // Add-item control — opens the dedicated Shopping List add form (writes to
+    // the shopping model only, never inventory).
     container.appendChild(
       h(
         'button',
         {
           class: 'btn ghost shopping-add',
           type: 'button',
-          onclick: function () { openForm(null); },
+          onclick: function () { openShoppingForm(null); },
         },
         '＋ ' + t('shopping.addItem')
       )
     );
 
-    if (!shortfall.length) {
+    // Suggestions from inventory "to restock" not already on the list.
+    var activeKeys = {};
+    active.forEach(function (s) { activeKeys[shopKey(s)] = true; });
+    var suggestions = computeShortfall().filter(function (sf) {
+      return !activeKeys[normName(sf.nameEn || sf.name || sf.nameHe || '')];
+    });
+
+    if (!active.length) {
       container.appendChild(
         h(
           'div',
           { class: 'shopping-empty' },
-          h('div', { class: 'shopping-empty-emoji', 'aria-hidden': 'true', text: '🎉' }),
+          h('div', { class: 'shopping-empty-emoji', 'aria-hidden': 'true', text: '🛒' }),
           h('div', { class: 'shopping-empty-text', text: t('shopping.empty') })
         )
       );
-      return;
+    } else {
+      var listWrap = h('div', { class: 'shopping-items' });
+      active.forEach(function (s) { listWrap.appendChild(renderShoppingRow(s)); });
+      container.appendChild(listWrap);
     }
-    var listWrap = h('div', { class: 'shopping-items' });
-    shortfall.forEach(function (s) {
-      listWrap.appendChild(renderShoppingRow(itemById(s.id), s));
-    });
-    container.appendChild(listWrap);
+
+    if (suggestions.length) {
+      container.appendChild(
+        h('div', { class: 'shopping-suggest-head' },
+          h('span', { class: 'shopping-suggest-title', text: t('shopping.suggestions') }),
+          h('span', { class: 'shopping-suggest-sub', text: t('shopping.suggestionsSub') })
+        )
+      );
+      var sugWrap = h('div', { class: 'shopping-suggestions' });
+      suggestions.forEach(function (sf) { sugWrap.appendChild(renderSuggestionRow(sf)); });
+      container.appendChild(sugWrap);
+    }
   }
 
-  // One row of the shared Shopping List. Reuses inventory item data + actions.
-  function renderShoppingRow(item, s) {
-    var unit = t('units.' + item.unit);
+  // One row of the Shopping List (a shopping-model item). name + needed qty +
+  // stepper, a purchased checkbox (=> purchase flow), and remove.
+  function renderShoppingRow(shop) {
+    var unit = t('units.' + (shop.unit || 'pcs'));
     var checkbox = h('input', {
       type: 'checkbox',
       class: 'shopping-check',
-      'aria-label': t('shopping.markRestocked'),
+      'aria-label': t('shopping.purchase'),
+      title: t('shopping.purchase'),
     });
-    checkbox.addEventListener('change', function () { completeRestock(item); });
-    var quick = h(
-      'button',
-      {
-        class: 'step-btn primary',
-        'aria-label': t('a11y.increase'),
-        onclick: function (e) { e.stopPropagation(); changeQty(item, 1); },
-      },
-      '+'
-    );
-    var remove = h(
-      'button',
-      {
-        class: 'shopping-remove',
-        'aria-label': t('shopping.remove'),
-        title: t('shopping.remove'),
-        onclick: function (e) { e.stopPropagation(); removeFromShopping(item); },
-      },
-      '✕'
-    );
+    checkbox.addEventListener('change', function () { purchaseShoppingItem(shop); });
+    var minus = h('button', {
+      class: 'step-btn',
+      'aria-label': t('a11y.decrease'),
+      onclick: function (e) { e.stopPropagation(); changeShoppingQty(shop, -1); },
+    }, '−');
+    var plus = h('button', {
+      class: 'step-btn primary',
+      'aria-label': t('a11y.increase'),
+      onclick: function (e) { e.stopPropagation(); changeShoppingQty(shop, 1); },
+    }, '+');
+    var remove = h('button', {
+      class: 'shopping-remove',
+      'aria-label': t('shopping.remove'),
+      title: t('shopping.remove'),
+      onclick: function (e) { e.stopPropagation(); removeShoppingItem(shop); },
+    }, '✕');
     return h(
       'div',
-      {
-        class: 'card shopping-row',
-        onclick: function () { openForm(item); },
-      },
+      { class: 'card shopping-row', onclick: function () { openShoppingForm(shop); } },
       checkbox,
-      itemThumb(item),
       h(
         'div',
         { class: 'card-info' },
-        h('div', { class: 'card-name', dir: 'auto', text: itemName(item) }),
+        h('div', { class: 'card-name', dir: 'auto', text: itemName(shop) }),
         h('div', {
           class: 'card-meta',
-          text: t('shopping.need', { missing: formatQty(s.missing), unit: unit }),
+          text: t('shopping.needQty', { qty: formatQty(shop.quantity || 1), unit: unit }),
         })
       ),
       remove,
-      quick
+      h('div', { class: 'shopping-step' }, minus, plus)
     );
   }
 
-  // Mark an item as restocked from the shopping list: fill it up to its target.
-  function completeRestock(item) {
-    var target = item.desiredAmount || 0;
-    if (target <= item.quantity) return;
-    var delta = target - item.quantity;
-    item.quantity = target;
-    window.PantryDB.put(item);
-    recordDelta(delta);
-    recomputeShortfall();
-    refreshAfterMutation(item);
+  // A suggestion row (inventory running low). The ＋ writes to the shopping
+  // list only — it does NOT modify inventory.
+  function renderSuggestionRow(sf) {
+    var inv = itemById(sf.id);
+    var unit = t('units.' + ((inv && inv.unit) || 'pcs'));
+    return h(
+      'div',
+      { class: 'card shopping-suggest-row' },
+      h(
+        'div',
+        { class: 'card-info' },
+        h('div', { class: 'card-name', dir: 'auto', text: sf.nameEn || sf.nameHe || sf.name }),
+        h('div', { class: 'card-meta', text: t('shopping.need', { missing: formatQty(sf.missing), unit: unit }) })
+      ),
+      h('button', {
+        class: 'step-btn primary shopping-suggest-add',
+        'aria-label': t('shopping.addToList'),
+        title: t('shopping.addToList'),
+        onclick: function (e) {
+          e.stopPropagation();
+          addToShoppingList({
+            name: inv ? inv.name : sf.name,
+            nameEn: sf.nameEn, nameHe: sf.nameHe,
+            quantity: sf.missing, unit: inv ? inv.unit : 'pcs',
+            categoryId: inv ? inv.categoryId : 'other',
+          });
+        },
+      }, '＋')
+    );
   }
 
-  // Remove an item from the shopping list without buying: lower its target to
-  // the current quantity so it is no longer "below target". Reversible via undo.
-  function removeFromShopping(item) {
-    var prevTarget = item.desiredAmount;
-    item.desiredAmount = item.quantity;
-    window.PantryDB.put(item);
-    recomputeShortfall();
-    refreshAfterMutation(item);
-    showToast(t('shopping.removed'), function () {
-      item.desiredAmount = prevTarget;
-      window.PantryDB.put(item);
-      recomputeShortfall();
-      refreshAfterMutation(item);
+  // Compact add/edit form for a Shopping List item (writes to shopping only).
+  function openShoppingForm(existing) {
+    var editing = !!existing;
+    var overlay = h('div', { class: 'overlay center' });
+    var prevReopen = reopenTop;
+    var myReopen = function () { openShoppingForm(existing); };
+    reopenTop = myReopen;
+    function close() {
+      overlay.remove();
+      if (reopenTop === myReopen) reopenTop = prevReopen;
+    }
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+
+    var nameInput = h('input', {
+      class: 'input', type: 'text', dir: 'auto',
+      placeholder: t('shopping.namePlaceholder'),
+      value: editing ? itemName(existing) : '',
     });
+    var qtyInput = h('input', {
+      class: 'input', type: 'number', min: '1', inputmode: 'numeric',
+      value: String(editing ? (existing.quantity || 1) : 1),
+    });
+    var unitSel = h('select', { class: 'input' });
+    UNITS.forEach(function (u) {
+      var o = h('option', { value: u, text: t('units.' + u) });
+      if ((editing ? existing.unit : 'pcs') === u) o.selected = true;
+      unitSel.appendChild(o);
+    });
+
+    var card = h(
+      'div', { class: 'sync-body shopping-form' },
+      h('h3', { dir: 'auto', text: editing ? t('shopping.editTitle') : t('shopping.addItem') }),
+      h('label', { class: 'field-label', text: t('shopping.nameLabel') }),
+      nameInput,
+      h('label', { class: 'field-label', text: t('shopping.quantity') }),
+      qtyInput,
+      h('label', { class: 'field-label', text: t('form.unit') }),
+      unitSel
+    );
+    var actions = h('div', { class: 'conflict-actions' });
+    actions.appendChild(h('button', { class: 'btn ghost', type: 'button', onclick: close }, t('form.cancel')));
+    actions.appendChild(h('button', { class: 'btn save', type: 'button', onclick: function () {
+      var nm = nameInput.value.trim();
+      if (!nm) { nameInput.focus(); return; }
+      var qv = parseInt(qtyInput.value, 10);
+      if (!(qv > 0)) qv = 1;
+      var lang = window.I18N.getLang();
+      if (editing) {
+        // Update the existing shopping record's active-language name + fields.
+        if (lang === 'he') existing.nameHe = nm; else existing.nameEn = nm;
+        existing.name = nm;
+        existing.quantity = qv;
+        existing.unit = unitSel.value;
+        window.PantryDB.putShopping(existing).then(function (saved) {
+          upsertLocalShopping(saved);
+          refreshShopping();
+        });
+      } else {
+        var input = { name: nm, quantity: qv, unit: unitSel.value };
+        if (lang === 'he') input.nameHe = nm; else input.nameEn = nm;
+        addToShoppingList(input);
+      }
+      close();
+    } }, t('shopping.save')));
+    card.appendChild(actions);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    try { nameInput.focus(); } catch (e) {}
   }
 
   // Re-render the current base screen (mobile page vs. inventory+panel) without
@@ -941,6 +1193,7 @@
 
   // Mobile dedicated Shopping List page (same shared renderer, 'page' mode).
   function renderShopping() {
+    if (!hasDOM()) return;
     if (!root) root = document.getElementById('root');
     currentView = 'shopping';
     root.innerHTML = '';
@@ -1002,6 +1255,7 @@
   }
 
   function renderMain() {
+    if (!hasDOM()) return;
     if (!root) root = document.getElementById('root');
     root.innerHTML = '';
 
@@ -2053,6 +2307,7 @@
 
   // ---- Toast ----
   function showToast(message, undoFn) {
+    if (!hasDOM()) return;
     var existing = document.querySelector('.toast');
     if (existing) existing.remove();
     var toast = h('div', { class: 'toast' }, h('span', { text: message }));
@@ -3364,6 +3619,7 @@
   function cloudTableFor(localTable) {
     if (localTable === 'inventoryItems') return 'inventory_items';
     if (localTable === 'barcodeMappings') return 'barcode_mappings';
+    if (localTable === 'shoppingItems') return 'shopping_list_items';
     return localTable;
   }
   function mapItemToCloud(rec, uid) {
@@ -3396,6 +3652,30 @@
     d.id = row.id;
     if (row.updated_at) d.updatedAt = row.updated_at;
     if (typeof row.quantity === 'number') d.quantity = row.quantity;
+    return d;
+  }
+  // Shopping List <-> shopping_list_items. product_id/list_id are left null
+  // (local refs live in `data`, same approach as inventory) to avoid uuid
+  // coercion against the deployed schema.
+  function mapShoppingToCloud(rec, uid) {
+    return {
+      id: rec.id,
+      user_id: uid,
+      list_id: null,
+      product_id: null,
+      name: rec.name || rec.nameEn || rec.nameHe || null,
+      quantity: typeof rec.quantity === 'number' ? rec.quantity : null,
+      checked: !!rec.purchased,
+      data: rec,
+      updated_at: rec.updatedAt || new Date().toISOString(),
+    };
+  }
+  function cloudRowToShopping(row) {
+    var d = (row && row.data) || {};
+    d.id = row.id;
+    if (row.updated_at) d.updatedAt = row.updated_at;
+    if (typeof row.quantity === 'number') d.quantity = row.quantity;
+    if (typeof row.checked === 'boolean') d.purchased = row.checked;
     return d;
   }
 
@@ -3459,6 +3739,8 @@
               ? mapItemToCloud(m.record, st.cloudUserId)
               : m.table === 'barcodeMappings'
               ? mapBarcodeToCloud(m.record, st.cloudUserId)
+              : m.table === 'shoppingItems'
+              ? mapShoppingToCloud(m.record, st.cloudUserId)
               : Object.assign({}, m.record, { user_id: st.cloudUserId });
           var recordId = m.record && (m.record.id || m.record.barcode);
           syncMgr.notifyLocalMutation({
@@ -3500,6 +3782,15 @@
   function syncPull(HS, repo, st) {
     var since = null;
     try { since = localStorage.getItem('pantry.sync.lastAt'); } catch (e) {}
+    // Pull inventory first, then the (separate) Shopping List. Independent
+    // tables, independent merges — a failure in one doesn't block the other's
+    // resolution, and each re-renders live.
+    return syncPullInventory(HS, repo, st, since).then(function () {
+      return syncPullShopping(HS, repo, st, since);
+    });
+  }
+
+  function syncPullInventory(HS, repo, st, since) {
     return repo.selectSince('inventory_items', st.cloudUserId, since).then(function (rows) {
       if (!rows || !rows.length) return null;
       return window.PantryDB.getAll().then(function (localItems) {
@@ -3530,8 +3821,58 @@
           }
         });
         return chain.then(function () {
-          if (applied) { recomputeShortfall(); renderCurrentView(); }
-          if (conflicts.length) syncQueueConflicts(HS, conflicts);
+          var done = Promise.resolve();
+          if (applied) {
+            // Reload the merged rows into memory so the live re-render reflects
+            // pulled changes (not the stale pre-merge snapshot).
+            done = window.PantryDB.getAll().then(function (fresh) {
+              items = (fresh || []).map(function (i) {
+                if (typeof i.desiredAmount !== 'number') i.desiredAmount = 0;
+                return i;
+              });
+              recomputeShortfall();
+              renderCurrentView();
+            });
+          }
+          return done.then(function () {
+            if (conflicts.length) syncQueueConflicts(HS, conflicts);
+          });
+        });
+      });
+    });
+  }
+
+  // Pull the Shopping List (its own table). Last-write-wins by updatedAt; no
+  // quantity-conflict dialog (needed-quantity edits are low-stakes) — remote
+  // deletions/edits simply merge. Updates the in-memory model + re-renders.
+  function syncPullShopping(HS, repo, st, since) {
+    return repo.selectSince('shopping_list_items', st.cloudUserId, since).then(function (rows) {
+      if (!rows || !rows.length) return null;
+      return window.PantryDB.getAllShopping().then(function (localShop) {
+        var localById = {};
+        localShop.forEach(function (x) { localById[x.id] = x; });
+        var chain = Promise.resolve();
+        var applied = 0;
+        rows.map(cloudRowToShopping).forEach(function (r) {
+          var winner = HS.ConflictResolver.resolveRecord(localById[r.id], r);
+          if (winner === r) {
+            applied++;
+            chain = chain.then(function () {
+              suppressSyncHook = true;
+              return window.PantryDB.putShopping(r).then(
+                function () { suppressSyncHook = false; },
+                function () { suppressSyncHook = false; }
+              );
+            });
+          }
+        });
+        return chain.then(function () {
+          if (applied) {
+            return window.PantryDB.getAllShopping().then(function (fresh) {
+              shoppingItems = fresh || [];
+              refreshShopping();
+            });
+          }
         });
       });
     });
@@ -3720,13 +4061,31 @@
     state = state || HS.Migration.emptyState();
     return window.PantryDB.getAll().then(function (items) {
       var plan = HS.Migration.planUploads(items, state);
+      var uploadInv = Promise.resolve();
+      if (plan.length) {
+        var rows = plan.map(function (r) { return mapItemToCloud(r, st.cloudUserId); });
+        uploadInv = repo.upsert('inventory_items', rows).then(function () {
+          var next = HS.Migration.markUploaded(state, plan.map(function (r) { return r.id; }));
+          try { localStorage.setItem(key, JSON.stringify(next)); } catch (e) {}
+        });
+      }
+      return uploadInv.then(function () { return syncMigrateShopping(HS, repo, st); });
+    });
+  }
+
+  // Idempotent upload of any locally-created Shopping List items (separate
+  // store, separate migration checkpoint). Never deletes local data.
+  function syncMigrateShopping(HS, repo, st) {
+    var key = 'pantry.sync.migration.shopping.' + st.cloudUserId;
+    var state;
+    try { state = JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) {}
+    state = state || HS.Migration.emptyState();
+    return window.PantryDB.getAllShopping().then(function (shop) {
+      var plan = HS.Migration.planUploads(shop || [], state);
       if (!plan.length) return null;
-      var rows = plan.map(function (r) { return mapItemToCloud(r, st.cloudUserId); });
-      return repo.upsert('inventory_items', rows).then(function () {
-        var next = HS.Migration.markUploaded(
-          state,
-          plan.map(function (r) { return r.id; })
-        );
+      var rows = plan.map(function (r) { return mapShoppingToCloud(r, st.cloudUserId); });
+      return repo.upsert('shopping_list_items', rows).then(function () {
+        var next = HS.Migration.markUploaded(state, plan.map(function (r) { return r.id; }));
         try { localStorage.setItem(key, JSON.stringify(next)); } catch (e) {}
       });
     });
@@ -4026,6 +4385,7 @@
     window.PantryDB.setUser(null); // drop data scope
     window.I18N.setUser(null); // back to the shared picker language
     items = [];
+    shoppingItems = [];
     renderSwitchUser();
   }
 
@@ -4112,9 +4472,19 @@
       syncConfigured: syncConfigured,
       cloudTableFor: cloudTableFor,
       mapItemToCloud: mapItemToCloud,
+      mapShoppingToCloud: mapShoppingToCloud,
+      cloudRowToShopping: cloudRowToShopping,
       isConcurrentQtyConflict: isConcurrentQtyConflict,
       parseLinkToken: parseLinkToken,
       syncAutoRedeem: syncAutoRedeem,
+      // Shopping List (separate model) — exposed for the logic harness.
+      addToShoppingList: addToShoppingList,
+      purchaseShoppingItem: purchaseShoppingItem,
+      removeShoppingItem: removeShoppingItem,
+      shoppingItems: function () { return shoppingItems; },
+      setShoppingItems: function (a) { shoppingItems = a || []; },
+      setItems: function (a) { items = a || []; },
+      getItems: function () { return items; },
       // Responsive Shopping List — one shared renderer + pure breakpoint logic.
       renderShoppingList: renderShoppingList,
       layoutModeForWidth: layoutModeForWidth,

@@ -729,6 +729,119 @@ async function rejects(name, fn) {
 
   delete global.fetch;
 
+  // ---------------------------------------------------------------------------
+  // Normalized name key (mirrors app.js shopKey) for matching in assertions.
+  function AppIkey(x) {
+    return String((x && (x.nameEn || x.name || x.nameHe)) || '')
+      .trim().toLowerCase().replace(/\s+/g, ' ');
+  }
+  console.log('\n[shopping: SEPARATE model, independent of inventory]');
+  ok('PantryDB exposes a dedicated shopping store API (separate from items)',
+    typeof DB.getAllShopping === 'function' && typeof DB.putShopping === 'function' &&
+    typeof DB.removeShopping === 'function');
+  ok('shopping maps to its OWN cloud table (shopping_list_items)',
+    AppI.cloudTableFor('shoppingItems') === 'shopping_list_items');
+
+  // Fresh, isolated user namespace for the shopping tests.
+  DB.setUser('shopA');
+  AppI.setItems(await DB.getAll());
+  AppI.setShoppingItems(await DB.getAllShopping());
+  var invBefore = (await DB.getAll()).length;
+
+  // (2) Add to shopping list must NOT touch inventory.
+  await AppI.addToShoppingList({ name: 'Bananas', quantity: 3, unit: 'pcs' });
+  var invAfterAdd = await DB.getAll();
+  var shopAfterAdd = await DB.getAllShopping();
+  ok('add-to-shopping does NOT create an inventory item (count unchanged)',
+    invAfterAdd.length === invBefore);
+  ok('add-to-shopping does NOT add Bananas to inventory',
+    !invAfterAdd.some(function (x) { return (x.name || '').toLowerCase() === 'bananas'; }));
+  ok('add-to-shopping DOES create a shopping item with the right qty',
+    shopAfterAdd.length === 1 && shopAfterAdd[0].quantity === 3 && !shopAfterAdd[0].purchased);
+
+  // Adding the same name again bumps qty (coalesce), never duplicates.
+  await AppI.addToShoppingList({ name: 'Bananas', quantity: 2, unit: 'pcs' });
+  var shopBump = await DB.getAllShopping();
+  ok('re-adding an existing shopping item bumps qty (no duplicate)',
+    shopBump.length === 1 && shopBump[0].quantity === 5);
+
+  // (3) Purchase flow — the ONLY path that touches inventory. No prior inventory
+  //     match => it CREATES the inventory item and completes the shopping item.
+  AppI.setItems(await DB.getAll());
+  AppI.setShoppingItems(await DB.getAllShopping());
+  var banShop = AppI.shoppingItems().find(function (x) { return AppIkey(x) === 'bananas'; });
+  await AppI.purchaseShoppingItem(banShop);
+  var invAfterBuy = await DB.getAll();
+  var shopAfterBuy = await DB.getAllShopping();
+  var banInv = invAfterBuy.find(function (x) { return (x.name || '').toLowerCase() === 'bananas'; });
+  ok('purchase CREATES the matching inventory item with the needed qty',
+    !!banInv && banInv.quantity === 5);
+  ok('purchase COMPLETES (removes) the shopping item',
+    !shopAfterBuy.some(function (x) { return AppIkey(x) === 'bananas'; }));
+
+  // Purchase when inventory already exists => INCREASES existing qty.
+  var milk = await DB.create({ name: 'Milk', quantity: 1, unit: 'L', categoryId: 'dairy' });
+  AppI.setItems(await DB.getAll());
+  AppI.setShoppingItems(await DB.getAllShopping());
+  await AppI.addToShoppingList({ name: 'Milk', quantity: 2, unit: 'L' });
+  AppI.setItems(await DB.getAll());
+  AppI.setShoppingItems(await DB.getAllShopping());
+  var milkShop = AppI.shoppingItems().find(function (x) { return AppIkey(x) === 'milk'; });
+  await AppI.purchaseShoppingItem(milkShop);
+  var milkInv = (await DB.getAll()).find(function (x) { return x.id === milk.id; });
+  ok('purchase INCREASES an existing inventory item (1 + 2 = 3)', milkInv && milkInv.quantity === 3);
+  ok('purchase did not duplicate the inventory item',
+    (await DB.getAll()).filter(function (x) { return (x.name || '').toLowerCase() === 'milk'; }).length === 1);
+  ok('purchased shopping item is gone from the list',
+    !(await DB.getAllShopping()).some(function (x) { return AppIkey(x) === 'milk'; }));
+
+  // (4) Per-user isolation for the shopping list.
+  AppI.setShoppingItems(await DB.getAllShopping());
+  await AppI.addToShoppingList({ name: 'Cheese', quantity: 1, unit: 'pcs' });
+  var aShop = await DB.getAllShopping();
+  DB.setUser('shopB');
+  var bShop = await DB.getAllShopping();
+  ok('a second user has an INDEPENDENT (empty) shopping list',
+    Array.isArray(bShop) && bShop.length === 0);
+  DB.setUser('shopA');
+  ok("first user's shopping list is intact after switching back",
+    (await DB.getAllShopping()).some(function (x) { return AppIkey(x) === 'cheese'; }) && aShop.length >= 1);
+
+  // (5) Sync participation: a shopping mutation fires the DB hook the sync
+  //     engine listens on, and maps to shopping_list_items.
+  var hooked = [];
+  DB.onMutation(function (m) { hooked.push(m); });
+  await DB.putShopping({ name: 'Eggs', quantity: 6, unit: 'pcs' });
+  await DB.removeShopping((await DB.getAllShopping()).find(function (x) { return AppIkey(x) === 'eggs'; }).id);
+  DB.onMutation(null);
+  ok('shopping upsert fires the sync mutation hook (table=shoppingItems)',
+    hooked.some(function (m) { return m.table === 'shoppingItems' && m.opType === 'upsert'; }));
+  ok('shopping delete fires the sync mutation hook',
+    hooked.some(function (m) { return m.table === 'shoppingItems' && m.opType === 'delete'; }));
+
+  // Cloud row mapping round-trip (shopping_list_items).
+  var srow = AppI.mapShoppingToCloud(
+    { id: 's1', name: 'Tea', nameEn: 'Tea', quantity: 2, unit: 'pcs', purchased: false, updatedAt: '2026-06-01' },
+    'hh-uuid'
+  );
+  ok('mapShoppingToCloud carries id/user_id/quantity/checked + full data blob',
+    srow.id === 's1' && srow.user_id === 'hh-uuid' && srow.quantity === 2 &&
+    srow.checked === false && srow.data && srow.data.name === 'Tea');
+  var sback = AppI.cloudRowToShopping({ id: 's1', updated_at: '2026-06-02', quantity: 9, checked: true, data: { name: 'Tea' } });
+  ok('cloudRowToShopping restores id/qty/updatedAt and checked->purchased',
+    sback.id === 's1' && sback.quantity === 9 && sback.purchased === true && sback.updatedAt === '2026-06-02');
+
+  ok('inventory model untouched: still no top-level shopping fields leaked',
+    (await DB.getAll()).every(function (x) { return typeof x.purchased === 'undefined'; }));
+
+  // New Shopping List strings present in BOTH languages.
+  ['shopping.purchase', 'shopping.purchased', 'shopping.addToList', 'shopping.addedToList',
+   'shopping.suggestions', 'shopping.needQty', 'shopping.quantity', 'shopping.save'].forEach(function (k) {
+    I18N.setLang('en'); var en = I18N.t(k);
+    I18N.setLang('he'); var he = I18N.t(k);
+    ok(k + ' (en+he present, non-key)', en !== k && he !== k);
+  });
+
   console.log('\n============================');
   console.log('PASS ' + pass + '  FAIL ' + fail);
   console.log('============================');

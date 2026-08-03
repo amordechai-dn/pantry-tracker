@@ -21,10 +21,13 @@
   'use strict';
 
   var BASE = 'pantry-tracker';
-  var DB_VERSION = 3;
+  var DB_VERSION = 4;
   var STORE = 'items';
   var BC_STORE = 'barcodes';
   var IMG_STORE = 'images';
+  // Shopping List is a SEPARATE feature with its OWN model — NOT derived from
+  // inventory. Its records (shopping_list_items) live in this dedicated store.
+  var SHOP_STORE = 'shopping';
 
   var useIDB = typeof indexedDB !== 'undefined';
 
@@ -34,6 +37,7 @@
   var LS_KEY = 'pantry.items.fallback';
   var BC_LS_KEY = 'pantry.barcodes.fallback';
   var IMG_LS_KEY = 'pantry.images.fallback';
+  var SHOP_LS_KEY = 'pantry.shopping.fallback';
   var MONTHLY_KEY = 'pantry.monthly.v1';
   var dbPromise = null;
   // When true (only during migration), unscoped access is temporarily allowed.
@@ -76,6 +80,7 @@
     LS_KEY = 'pantry.items.fallback' + dot(currentUser);
     BC_LS_KEY = 'pantry.barcodes.fallback' + dot(currentUser);
     IMG_LS_KEY = 'pantry.images.fallback' + dot(currentUser);
+    SHOP_LS_KEY = 'pantry.shopping.fallback' + dot(currentUser);
     MONTHLY_KEY = 'pantry.monthly.v1' + dot(currentUser);
     dbPromise = null;
   }
@@ -111,6 +116,10 @@
         // De-duplicated image store, keyed by content hash (dedup-on-write).
         if (!db.objectStoreNames.contains(IMG_STORE)) {
           db.createObjectStore(IMG_STORE, { keyPath: 'hash' });
+        }
+        // Shopping List store (v4). A standalone model, independent of items.
+        if (!db.objectStoreNames.contains(SHOP_STORE)) {
+          db.createObjectStore(SHOP_STORE, { keyPath: 'id' });
         }
       };
       req.onsuccess = function () {
@@ -438,6 +447,84 @@
     });
   }
 
+  // ---- Shopping List store (per user) ---------------------------------------
+  // A SEPARATE feature with its own model (shopping_list_items). Independent of
+  // inventory: writes here never touch the `items` store. Records look like:
+  //   { id, name, nameEn, nameHe, quantity, unit, categoryId, note,
+  //     purchased(bool), createdAt, updatedAt }
+  function shopLsRead() {
+    try { return JSON.parse(localStorage.getItem(SHOP_LS_KEY) || '[]') || []; }
+    catch (e) { return []; }
+  }
+  function shopLsWrite(arr) {
+    try { localStorage.setItem(SHOP_LS_KEY, JSON.stringify(arr || [])); } catch (e) {}
+  }
+  function getAllShopping() {
+    if (!scoped()) return scopeError();
+    if (!useIDB) {
+      return Promise.resolve(shopLsRead().slice().sort(function (a, b) {
+        return String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
+      }));
+    }
+    return tx('readonly', SHOP_STORE).then(function (store) {
+      return new Promise(function (resolve, reject) {
+        var req = store.getAll();
+        req.onsuccess = function () {
+          var arr = req.result || [];
+          arr.sort(function (a, b) {
+            return String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
+          });
+          resolve(arr);
+        };
+        req.onerror = function () { reject(req.error); };
+      });
+    });
+  }
+  function putShopping(rec) {
+    if (!scoped()) return scopeError();
+    if (!rec) return Promise.resolve(null);
+    if (!rec.id) rec.id = 'sl_' + newId();
+    if (!rec.createdAt) rec.createdAt = new Date().toISOString();
+    rec.updatedAt = new Date().toISOString();
+    if (!useIDB) {
+      var arr = shopLsRead();
+      var idx = arr.findIndex(function (x) { return x.id === rec.id; });
+      if (idx >= 0) arr[idx] = rec; else arr.push(rec);
+      shopLsWrite(arr);
+      notifyMutation('shoppingItems', 'upsert', rec);
+      return Promise.resolve(rec);
+    }
+    return tx('readwrite', SHOP_STORE).then(function (store) {
+      return new Promise(function (resolve, reject) {
+        var req = store.put(rec);
+        req.onsuccess = function () {
+          notifyMutation('shoppingItems', 'upsert', rec);
+          resolve(rec);
+        };
+        req.onerror = function () { reject(req.error); };
+      });
+    });
+  }
+  function removeShopping(id) {
+    if (!scoped()) return scopeError();
+    if (!id) return Promise.resolve();
+    if (!useIDB) {
+      shopLsWrite(shopLsRead().filter(function (x) { return x.id !== id; }));
+      notifyMutation('shoppingItems', 'delete', { id: id });
+      return Promise.resolve();
+    }
+    return tx('readwrite', SHOP_STORE).then(function (store) {
+      return new Promise(function (resolve, reject) {
+        var req = store.delete(id);
+        req.onsuccess = function () {
+          notifyMutation('shoppingItems', 'delete', { id: id });
+          resolve();
+        };
+        req.onerror = function () { reject(req.error); };
+      });
+    });
+  }
+
   // ---- Monthly restock log (on-device, keyed by YYYY-MM, per user) ----
   //   { "2026-08": { restocked: n, consumed: n, shortfall: [ {name,missing,have,target} ] } }
   function getMonthlyLog() {
@@ -464,6 +551,7 @@
         'pantry.items.fallback.' + userId,
         'pantry.barcodes.fallback.' + userId,
         'pantry.images.fallback.' + userId,
+        'pantry.shopping.fallback.' + userId,
         'pantry.monthly.v1.' + userId,
         'pantry.lang.' + userId,
         'pantry.imgmig.v1.' + userId,
@@ -580,6 +668,10 @@
     remove: remove,
     getBarcode: getBarcode,
     putBarcode: putBarcode,
+    // Shopping List — separate model, independent write path.
+    getAllShopping: getAllShopping,
+    putShopping: putShopping,
+    removeShopping: removeShopping,
     getAllImages: getAllImages,
     getImage: getImage,
     putImage: putImage,

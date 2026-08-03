@@ -198,6 +198,44 @@ body {
 .shopping-remove:active {
   opacity: 0.6;
 }
+.shopping-step {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.shopping-suggest-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-block: 14px 6px;
+  flex-wrap: wrap;
+}
+.shopping-suggest-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+.shopping-suggest-sub {
+  color: var(--muted);
+  font-size: 12px;
+}
+.shopping-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  opacity: 0.92;
+}
+.shopping-suggest-row {
+  gap: 10px;
+}
+.shopping-suggest-add {
+  flex: 0 0 auto;
+}
+.shopping-form h3 {
+  margin: 0 0 4px;
+}
+.shopping-form .field-label {
+  margin-block-start: 6px;
+}
 .shopping-empty {
   text-align: center;
   color: var(--muted);
