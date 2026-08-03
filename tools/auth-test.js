@@ -842,6 +842,76 @@ async function rejects(name, fn) {
     ok(k + ' (en+he present, non-key)', en !== k && he !== k);
   });
 
+  // ---- Automatic profile-based household (v2.1.0) --------------------------
+  // Deterministic key derivation + the join_or_create_household RPC contract +
+  // graceful fallback when the schema hasn't been re-run + idempotent upload.
+  console.log('\n[sync: automatic profile-based household]');
+  var HK = HS.HouseholdKey;
+  ok('HomeSync exports HouseholdKey (derive + hash)',
+    !!(HK && HK.deriveKeyString && HK.deriveKeyHash && HK.normalizeName));
+  ok('normalizeName trims + lowercases + collapses spaces',
+    HK.normalizeName('  AV   Razi ') === 'av razi');
+  ok('key string is versioned and name-only when no code',
+    HK.deriveKeyString('AV', '') === 'homestock:v1:av');
+  ok('key string folds in the family code when present',
+    HK.deriveKeyString('AV', 'Fam 1') === 'homestock:v1:av:fam 1');
+
+  var hAV = await HK.deriveKeyHash('AV', '');
+  var hAVspaced = await HK.deriveKeyHash('  Av  ', '');
+  var hAVcode1 = await HK.deriveKeyHash('AV', 'fam1');
+  var hAVcode2 = await HK.deriveKeyHash('AV', 'fam2');
+  var hBob = await HK.deriveKeyHash('Bob', '');
+  ok('same normalized name => SAME key hash (cross-device convergence)', hAV === hAVspaced);
+  ok('key hash is 64-hex SHA-256', /^[0-9a-f]{64}$/.test(hAV));
+  ok('adding a family code => DIFFERENT key hash', hAVcode1 !== hAV);
+  ok('different family codes => different key hashes', hAVcode1 !== hAVcode2);
+  ok('different names => different key hashes', hBob !== hAV);
+
+  // RPC contract: joinOrCreateHousehold posts the key HASH (never plaintext) to
+  // the right endpoint and returns the household uuid. Two independent sessions
+  // sending the SAME hash both hit the same RPC with the same body → the server
+  // returns the same household (convergence). Only the hash leaves the client.
+  var calls21 = makeFetch({
+    '/rest/v1/rpc/join_or_create_household': [{ status: 200, body: 'hh-shared-uuid' }],
+  });
+  var repo21a = new HS.CloudRepository(cfg14, { access_token: 't' });
+  var repo21b = new HS.CloudRepository(cfg14, { access_token: 't' });
+  var hidA = await repo21a.joinOrCreateHousehold(hAV);
+  var hidB = await repo21b.joinOrCreateHousehold(hAV);
+  ok('joinOrCreateHousehold returns the household uuid', hidA === 'hh-shared-uuid');
+  ok('two sessions with the SAME key hash converge to the SAME household', hidA === hidB);
+  var joinCall = calls21.find(function (c) { return c.url.indexOf('join_or_create_household') >= 0; });
+  var sentBody = joinCall ? JSON.parse(joinCall.opts.body) : {};
+  ok('RPC body carries the key HASH under p_key_hash', sentBody.p_key_hash === hAV);
+  ok('the raw name/code is NEVER sent (only the hash)',
+    joinCall && joinCall.opts.body.indexOf('homestock:v1') === -1 && !/\"av\"/.test(joinCall.opts.body));
+
+  // Graceful fallback: if the schema wasn't re-run, the RPC 404s and the client
+  // surfaces a detectable status so the app can show "re-run schema" (not error).
+  makeFetch({
+    '/rest/v1/rpc/join_or_create_household': [
+      { status: 404, body: { code: 'PGRST202', message: 'Could not find the function public.join_or_create_household' } },
+    ],
+  });
+  var repo21c = new HS.CloudRepository(cfg14, { access_token: 't' });
+  var joinErr = null;
+  await repo21c.joinOrCreateHousehold(hAV).catch(function (e) { joinErr = e; });
+  ok('missing RPC rejects with a 404 the app can detect (graceful fallback)',
+    !!(joinErr && joinErr.status === 404 && /PGRST202|join_or_create_household/i.test(joinErr.message)));
+
+  // Idempotent local→cloud upload on join: all local ids are planned once, then
+  // nothing re-uploads (so converging a device uploads its items exactly once).
+  var mig0 = HS.Migration.emptyState();
+  var localForJoin = [{ id: 'i1' }, { id: 'i2' }, { id: 'i3' }];
+  var plan1 = HS.Migration.planUploads(localForJoin, mig0);
+  ok('join uploads ALL local items the first time', plan1.length === 3);
+  var mig1 = HS.Migration.markUploaded(mig0, plan1.map(function (r) { return r.id; }));
+  ok('after upload, nothing re-uploads (idempotent, no data churn)',
+    HS.Migration.planUploads(localForJoin, mig1).length === 0);
+  ok('a NEW item still uploads after a prior converge',
+    HS.Migration.planUploads(localForJoin.concat([{ id: 'i4' }]), mig1).length === 1);
+  delete global.fetch;
+
   // ---- Scanner decode-path proof (vendored ZXing) --------------------------
   // Root-causes the "camera works but zero detections" bug from the OTHER end:
   // it proves the vendored @zxing/library decode call path + our exact hints

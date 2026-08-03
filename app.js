@@ -3679,6 +3679,7 @@
   var qrPromise = null; // lazy-load promise for vendor/qrcode.js
   var suppressSyncHook = false; // guard so remote-applied writes don't re-queue
   var pendingLinkToken = null; // a #link= token captured at startup (auto-join)
+  var syncSchemaOutdated = false; // set when join_or_create_household is missing
 
   // Parse a device-link token from the current URL (#link= or ?link=).
   function parseLinkToken() {
@@ -3739,6 +3740,48 @@
   function syncLinked() {
     var s = syncLoadState();
     return !!(s && s.cloudUserId && s.session);
+  }
+
+  // ---- Automatic profile-based household (deterministic, no QR) -------------
+  function syncProfileId() {
+    return (window.CurrentUser && window.CurrentUser.id && window.CurrentUser.id()) || 'anon';
+  }
+  function syncProfileName() {
+    try {
+      return (window.CurrentUser && window.CurrentUser.displayName && window.CurrentUser.displayName()) || '';
+    } catch (e) { return ''; }
+  }
+  // Optional "family sync code" (shared passphrase), persisted per profile.
+  // Empty = auto-share by name only. When set, it must match on other devices.
+  function syncFamilyCodeKey() { return 'pantry.sync.familyCode.' + syncProfileId(); }
+  function syncGetFamilyCode() {
+    try { return localStorage.getItem(syncFamilyCodeKey()) || ''; } catch (e) { return ''; }
+  }
+  function syncSetFamilyCode(v) {
+    try {
+      if (v) localStorage.setItem(syncFamilyCodeKey(), v);
+      else localStorage.removeItem(syncFamilyCodeKey());
+    } catch (e) {}
+  }
+  // Per-profile opt-out: set when the user taps Disconnect so we DON'T silently
+  // auto-rejoin on the next login. Cleared by "Enable sync".
+  function syncOptOutKey() { return 'pantry.sync.optout.' + syncProfileId(); }
+  function syncOptedOut() {
+    try { return localStorage.getItem(syncOptOutKey()) === '1'; } catch (e) { return false; }
+  }
+  function syncSetOptedOut(on) {
+    try {
+      if (on) localStorage.setItem(syncOptOutKey(), '1');
+      else localStorage.removeItem(syncOptOutKey());
+    } catch (e) {}
+  }
+  // Does an error from the join RPC mean the DB schema hasn't been re-run?
+  function isSchemaMissingError(err) {
+    var msg = (err && err.message) || '';
+    return !!(
+      (err && err.status === 404) ||
+      /PGRST202|join_or_create_household|Could not find the function|does not exist|42883/i.test(msg)
+    );
   }
 
   function loadHomeSync() {
@@ -4093,6 +4136,96 @@
     document.body.appendChild(overlay);
   }
 
+  // ===== Automatic profile-based join (the zero-friction path) =============
+  // Derives a deterministic household key from the active profile (normalized
+  // display name + optional family code), signs in anonymously (reusing any
+  // saved session), and calls join_or_create_household so this device converges
+  // to the SAME shared household as the same profile on any other device — with
+  // NO QR/link step. Then it uploads local data (idempotent) and boots the
+  // engine (push + pull) so the device shows the merged shared data.
+  //
+  // Idempotent + safe to call on every login: same profile => same household.
+  // If the profile previously created its OWN separate household, this converges
+  // it to the deterministic one and re-uploads local rows to the shared id.
+  // Degrades gracefully if the RPC is missing (schema not re-run yet).
+  function syncAutoJoin(opts) {
+    opts = opts || {};
+    if (!syncConfigured()) return Promise.resolve(false);
+    if (syncOptedOut() && !opts.force) return Promise.resolve(false);
+    var name = syncProfileName();
+    if (!name) return Promise.resolve(false); // need an identity to derive a key
+    var profile = syncProfileId();
+    return loadHomeSync()
+      .then(function (HS) {
+        if (syncProfileId() !== profile) return false; // profile switched mid-load
+        var cfg = syncGetConfig();
+        var st = syncLoadState();
+        var repo = new HS.CloudRepository(cfg, st.session);
+        repo.onSession = function (sess) {
+          var cur = syncLoadState();
+          cur.session = sess;
+          syncSaveState(cur);
+        };
+        return HS.HouseholdKey.deriveKeyHash(name, syncGetFamilyCode()).then(function (keyHash) {
+          if (!keyHash) return false;
+          var ensure = st.session ? Promise.resolve(st.session) : repo.signInAnonymously();
+          return ensure
+            .then(function () {
+              // Persist the anon session immediately (before the RPC) so a
+              // missing RPC / transient failure doesn't mint a brand-new
+              // anonymous user on every login. No cloudUserId yet => still
+              // dormant until the join succeeds.
+              if (repo.session && repo.session !== st.session) {
+                var cur = syncLoadState();
+                cur.session = repo.session;
+                if (!cur.deviceId) cur.deviceId = HS.DeviceLink.generateToken(8);
+                syncSaveState(cur);
+              }
+              return repo.joinOrCreateHousehold(keyHash);
+            })
+            .then(function (hid) {
+              hid = normalizeHouseholdId(hid);
+              if (!hid) return false;
+              syncSchemaOutdated = false;
+              var changed = st.cloudUserId && st.cloudUserId !== hid;
+              var next = {
+                cloudUserId: hid,
+                session: repo.session,
+                deviceId: st.deviceId || HS.DeviceLink.generateToken(8),
+                keyHash: keyHash,
+              };
+              syncSaveState(next);
+              syncSetOptedOut(false);
+              // Household changed (family code edited, or converging away from a
+              // pre-existing separate household): pull the whole shared set and
+              // re-upload local rows under the new household id.
+              if (changed) { try { localStorage.removeItem('pantry.sync.lastAt'); } catch (e) {} }
+              return syncMigrateLocal(HS, repo, next).then(function () {
+                if (syncProfileId() === profile) syncBoot();
+                return true;
+              });
+            });
+        });
+      })
+      .catch(function (err) {
+        if (isSchemaMissingError(err)) {
+          // Not an app error: the user just needs to re-run schema.sql once.
+          syncSchemaOutdated = true;
+          updateSyncIndicator(syncMgr ? syncMgr.status : 'idle');
+        }
+        return false;
+      });
+  }
+
+  // PostgREST scalar RPCs may return the bare uuid, a quoted string, or a
+  // single-element array depending on version — normalize to a plain string.
+  function normalizeHouseholdId(v) {
+    if (v == null) return null;
+    if (Array.isArray(v)) return v.length ? normalizeHouseholdId(v[0]) : null;
+    if (typeof v === 'object') return v.household_id || v.id || null;
+    return String(v);
+  }
+
   // First device: anonymous sign-in, create household, migrate local data up.
   function syncEnableFirstDevice() {
     return loadHomeSync().then(function (HS) {
@@ -4247,6 +4380,8 @@
     try {
       localStorage.removeItem(syncStateKey());
     } catch (e) {}
+    // Remember the opt-out so we don't silently auto-rejoin on the next login.
+    syncSetOptedOut(true);
   }
 
   // Subtle header status indicator (only present when sync is configured).
@@ -4288,6 +4423,31 @@
       return h('button', { class: 'btn ' + (cls || 'ghost'), type: 'button', onclick: onClick }, label);
     }
 
+    // Optional family sync code field (privacy). Empty = auto-share by name.
+    function familyCodeField() {
+      var wrap = h('div', { class: 'sync-family' });
+      wrap.appendChild(h('label', { class: 'field-label', text: t('sync.familyCode') }));
+      var input = h('input', {
+        class: 'input', type: 'text', dir: 'auto',
+        value: syncGetFamilyCode(), placeholder: t('sync.familyCodePlaceholder'),
+      });
+      wrap.appendChild(input);
+      wrap.appendChild(note(t('sync.familyCodeHint')));
+      wrap.appendChild(btn(t('sync.familyCodeSave'), 'save', function () {
+        var v = input.value.trim();
+        var changed = v !== syncGetFamilyCode();
+        syncSetFamilyCode(v);
+        if (!changed) { showToast(t('sync.saved')); return; }
+        // Re-derive the household immediately so devices re-converge.
+        input.disabled = true;
+        syncAutoJoin({ force: true }).then(function () {
+          showToast(t('sync.familyCodeApplied'));
+          rebuild();
+        });
+      }));
+      return wrap;
+    }
+
     function rebuild() {
       body.innerHTML = '';
       var configured = syncConfigured();
@@ -4295,6 +4455,17 @@
 
       if (!configured) {
         body.appendChild(note(t('sync.dormantNote')));
+      }
+
+      // Schema not re-run yet: precise, non-alarming guidance (auto-join needs
+      // the join_or_create_household RPC). Never surfaces as a data-sync error.
+      if (configured && syncSchemaOutdated) {
+        body.appendChild(note(t('sync.schemaOutdated'), 'sync-error'));
+      }
+
+      // Automatic profile-based sync explainer (the zero-friction default).
+      if (configured) {
+        body.appendChild(note(t('sync.autoInfo')));
       }
 
       // Status + last sync (when linked).
@@ -4377,23 +4548,32 @@
             renderMain();
           }
         }));
+        // Optional family code (privacy) — also available before linking below.
+        body.appendChild(familyCodeField());
       } else if (configured) {
-        // Configured but not yet linked on this profile.
+        // Configured but not linked yet on this profile (fresh, or opted-out).
+        // The primary path is now ONE tap "Enable" that auto-joins the shared,
+        // profile-based household — no QR, no code.
         body.appendChild(btn(t('sync.enable'), 'save', function () {
           body.appendChild(note(t('sync.enabling')));
-          syncEnableFirstDevice().then(function () {
+          syncAutoJoin({ force: true }).then(function (ok) {
             close();
             renderMain();
             openSyncSettings();
-          }).catch(function () {
-            body.appendChild(note(t('sync.errGeneric'), 'sync-error'));
+            if (!ok && !syncSchemaOutdated) showToast(t('sync.errGeneric'));
           });
         }));
 
+        // Family code (optional, for privacy) applies to the auto-join above.
+        body.appendChild(familyCodeField());
+
+        // Advanced: join by a link code from another device (legacy/manual).
+        var advLink = h('details', { class: 'sync-advanced' });
+        advLink.appendChild(h('summary', { text: t('sync.advancedLink') }));
         var codeInput = h('input', { class: 'input', type: 'text', placeholder: t('sync.codePlaceholder'), dir: 'ltr' });
-        body.appendChild(h('label', { class: 'field-label', text: t('sync.enterCode') }));
-        body.appendChild(codeInput);
-        body.appendChild(btn(t('sync.linkThisDevice'), 'ghost', function () {
+        advLink.appendChild(h('label', { class: 'field-label', text: t('sync.enterCode') }));
+        advLink.appendChild(codeInput);
+        advLink.appendChild(btn(t('sync.linkThisDevice'), 'ghost', function () {
           var code = codeInput.value.trim();
           if (!code) return;
           syncLinkThisDevice(code).then(function () {
@@ -4401,9 +4581,10 @@
             renderMain();
             openSyncSettings();
           }).catch(function () {
-            body.appendChild(note(t('sync.errLink'), 'sync-error'));
+            advLink.appendChild(note(t('sync.errLink'), 'sync-error'));
           });
         }));
+        body.appendChild(advLink);
       }
 
       // Backend override (URL + anon key) — ADVANCED + optional, tucked away in
@@ -4518,13 +4699,18 @@
       .then(function () {
         recomputeShortfall();
         renderMain();
-        // Wake cross-device sync ONLY if configured + linked (else dormant).
-        syncBoot();
-        // If we arrived via a device-link URL / QR, auto-join now.
+        // If we arrived via a device-link URL / QR, honor that explicit action
+        // first (advanced path). Otherwise auto-join the deterministic,
+        // profile-based household so the SAME profile shares across devices with
+        // NO manual step. Falls back to a plain boot if unconfigured/opted-out.
         if (pendingLinkToken) {
           var tk = pendingLinkToken;
           pendingLinkToken = null;
           syncAutoRedeem(tk);
+        } else if (syncConfigured() && !syncOptedOut()) {
+          syncAutoJoin();
+        } else {
+          syncBoot(); // dormant unless already linked
         }
       });
   }

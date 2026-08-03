@@ -47,6 +47,19 @@ create table if not exists device_links (
 );
 create index if not exists idx_dl_household on device_links(household_id);
 
+-- Deterministic, profile-based household identity (AUTOMATIC cross-device sync).
+-- Maps a SHA-256 hash of the derived household key (normalized display name +
+-- optional family sync code) to a household. The SAME profile on any device
+-- resolves the SAME household with NO manual QR/link step. Only the HASH is
+-- stored here — never the plaintext name/code. Direct table access is denied by
+-- RLS (no policy); only the SECURITY DEFINER join RPC below may read/write it.
+create table if not exists household_keys (
+  key_hash     bytea primary key,
+  household_id uuid not null references households(id) on delete cascade,
+  created_at   timestamptz not null default now()
+);
+create index if not exists idx_hk_household on household_keys(household_id);
+
 -- Convenience: households the current caller belongs to.
 create or replace function my_households()
 returns setof uuid language sql stable security definer set search_path = public, extensions as $$
@@ -174,6 +187,10 @@ create index if not exists idx_sm_user on sync_metadata(user_id);
 alter table households          enable row level security;
 alter table household_members   enable row level security;
 alter table device_links        enable row level security;
+alter table household_keys      enable row level security;
+-- household_keys has NO policy on purpose: deny ALL direct access. Only the
+-- SECURITY DEFINER join_or_create_household() function may touch it, so key
+-- hashes can never be enumerated or reverse-looked-up by clients.
 alter table users               enable row level security;
 alter table products            enable row level security;
 alter table inventory_items     enable row level security;
@@ -235,6 +252,33 @@ begin
   return hid;
 end $$;
 
+-- AUTOMATIC profile-based join (no QR). Given the SHA-256 hex of the derived
+-- household key, find the mapped household or create one, record the mapping
+-- (hash only), and enroll the caller as a member. Idempotent and safe to call
+-- on every login: repeat calls for the same key return the same household and
+-- do nothing new. SECURITY DEFINER so a not-yet-member caller can enroll iff
+-- they present a valid key hash; RLS still confines all DATA access afterwards.
+create or replace function join_or_create_household(p_key_hash text)
+returns uuid language plpgsql security definer set search_path = public, extensions as $$
+declare hid uuid; kh bytea;
+begin
+  if auth.uid() is null then raise exception 'not authenticated'; end if;
+  if p_key_hash is null or length(p_key_hash) = 0 then raise exception 'empty key'; end if;
+  kh := decode(p_key_hash, 'hex');
+  select household_id into hid from household_keys where key_hash = kh;
+  if hid is null then
+    insert into households default values returning id into hid;
+    insert into household_keys(key_hash, household_id) values (kh, hid)
+      on conflict (key_hash) do nothing;
+    -- Resolve a concurrent creator race: always read back the winning mapping.
+    select household_id into hid from household_keys where key_hash = kh;
+  end if;
+  insert into household_members(household_id, member_uid)
+    values (hid, auth.uid())
+    on conflict do nothing;
+  return hid;
+end $$;
+
 -- Existing member: mint a link token (stored only as a digest). Raw token is
 -- provided by the caller (crypto-random on the client) and never persisted.
 create or replace function create_link_token(p_token text, p_expires_minutes int default 60)
@@ -279,6 +323,7 @@ begin
 end $$;
 
 grant execute on function create_household()            to anon, authenticated;
+grant execute on function join_or_create_household(text) to anon, authenticated;
 grant execute on function create_link_token(text, int)  to anon, authenticated;
 grant execute on function redeem_link_token(text)       to anon, authenticated;
 grant execute on function revoke_link_tokens()          to anon, authenticated;

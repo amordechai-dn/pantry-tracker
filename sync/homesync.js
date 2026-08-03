@@ -351,6 +351,51 @@
     },
   };
 
+  // ----------------------------------------------------------- HouseholdKey --
+  // Deterministic, profile-based household identity so the SAME profile on
+  // different devices converges to the SAME cloud household with NO manual
+  // QR/link step. The key is derived purely from the profile's normalized
+  // display name plus an OPTIONAL "family sync code" (a shared passphrase). We
+  // never transmit the plaintext key — only its SHA-256 hash — and the server
+  // stores only the hash (see join_or_create_household in schema.sql).
+  //
+  // SECURITY: name-only auto-join on a public deployment means anyone who
+  // guesses a display name could join that household. The optional family sync
+  // code closes that gap (must match to share). RLS still confines access to a
+  // household's own rows, and the client only ever holds the public anon key.
+  function _norm(s) {
+    return String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  }
+  function _toHex(buf) {
+    var b = new Uint8Array(buf);
+    var hex = '';
+    for (var i = 0; i < b.length; i++) hex += ('0' + b[i].toString(16)).slice(-2);
+    return hex;
+  }
+  var HouseholdKey = {
+    normalizeName: function (name) { return _norm(name); },
+    // Stable, versioned key string. Same (name[, code]) => identical string on
+    // every device. Code is folded in only when non-empty.
+    deriveKeyString: function (name, code) {
+      var n = _norm(name);
+      var c = _norm(code);
+      return 'homestock:v1:' + n + (c ? ':' + c : '');
+    },
+    // SHA-256 hex of an arbitrary string (WebCrypto in browsers + Node ≥ 15).
+    hashString: function (str) {
+      var c = getCrypto();
+      if (!c || !c.subtle) return Promise.resolve(null);
+      var enc = typeof TextEncoder !== 'undefined'
+        ? new TextEncoder().encode(str)
+        : Buffer.from(str, 'utf8');
+      return Promise.resolve(c.subtle.digest('SHA-256', enc)).then(_toHex);
+    },
+    // Convenience: hash of the derived key string (what we send to the RPC).
+    deriveKeyHash: function (name, code) {
+      return HouseholdKey.hashString(HouseholdKey.deriveKeyString(name, code));
+    },
+  };
+
   // -------------------------------------------------------- CloudRepository --
   // Thin PostgREST + GoTrue client. Anonymous auth: each device signs in
   // anonymously (its own auth.uid()); household membership (shared user_id) is
@@ -473,6 +518,17 @@
       method: 'POST',
       headers: this._headers(),
       body: JSON.stringify({ p_token: token }),
+    }); // returns household uuid
+  };
+  // Automatic, profile-based join: given the SHA-256 hex of the derived
+  // household key, find-or-create the shared household and enroll this device.
+  // Returns the household uuid. Requires the join_or_create_household RPC from
+  // the updated schema.sql; a 404/PGRST202 here means the DB needs re-running.
+  CloudRepository.prototype.joinOrCreateHousehold = function (keyHashHex) {
+    return this._fetch('/rest/v1/rpc/join_or_create_household', {
+      method: 'POST',
+      headers: this._headers(),
+      body: JSON.stringify({ p_key_hash: keyHashHex }),
     }); // returns household uuid
   };
   CloudRepository.prototype.revokeLinkTokens = function () {
@@ -712,6 +768,7 @@
     ConflictResolver: ConflictResolver,
     Migration: Migration,
     DeviceLink: DeviceLink,
+    HouseholdKey: HouseholdKey,
     CloudRepository: CloudRepository,
     SyncManager: SyncManager,
     _util: { bytesToB64Url: bytesToB64Url, nowIso: nowIso },

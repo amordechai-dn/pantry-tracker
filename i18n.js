@@ -257,6 +257,17 @@
         errGeneric: 'Something went wrong. Please try again.',
         linkUnavailable:
           'Device linking needs a one-time backend update. Re-run sync/schema.sql in Supabase. Data sync keeps working.',
+        autoInfo:
+          'Automatic: the same profile name syncs across your devices — no QR or codes needed.',
+        familyCode: 'Family sync code (optional)',
+        familyCodePlaceholder: 'Leave empty to sync by name only',
+        familyCodeHint:
+          'For privacy: set the same code on every device to share this profile. Empty means anyone using the same profile name syncs together.',
+        familyCodeSave: 'Save code',
+        familyCodeApplied: 'Sync code applied — re-syncing your devices.',
+        schemaOutdated:
+          'Automatic sync needs a one-time database update: re-run sync/schema.sql in Supabase (adds join_or_create_household). Until then this device keeps working offline.',
+        advancedLink: 'Advanced: link with a code instead',
       },
       auth: {
         title: 'HomeStock',
@@ -555,6 +566,17 @@
         errGeneric: 'משהו השתבש. נסו שוב.',
         linkUnavailable:
           'קישור מכשירים דורש עדכון חד-פעמי בשרת. הריצו מחדש את sync/schema.sql ב-Supabase. סנכרון הנתונים ממשיך לעבוד.',
+        autoInfo:
+          'אוטומטי: אותו שם פרופיל מסתנכרן בין המכשירים שלכם — ללא QR או קודים.',
+        familyCode: 'קוד סנכרון משפחתי (אופציונלי)',
+        familyCodePlaceholder: 'השאירו ריק כדי לסנכרן לפי שם בלבד',
+        familyCodeHint:
+          'לפרטיות: הגדירו את אותו קוד בכל מכשיר כדי לשתף את הפרופיל. ריק פירושו שכל מי שמשתמש באותו שם פרופיל מסתנכרן יחד.',
+        familyCodeSave: 'שמירת קוד',
+        familyCodeApplied: 'קוד הסנכרון הוחל — מסנכרן מחדש את המכשירים.',
+        schemaOutdated:
+          'סנכרון אוטומטי דורש עדכון חד-פעמי במסד הנתונים: הריצו מחדש את sync/schema.sql ב-Supabase (מוסיף את join_or_create_household). עד אז המכשיר ממשיך לעבוד לא מקוון.',
+        advancedLink: 'מתקדם: קישור באמצעות קוד במקום',
       },
       auth: {
         title: 'HomeStock',
