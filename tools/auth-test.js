@@ -350,7 +350,7 @@ async function rejects(name, fn) {
   ['scan.manualBarcode', 'scan.manualBarcodeTitle', 'scan.manualBarcodeLabel',
    'scan.manualBarcodePlaceholder', 'scan.manualBarcodeSubmit',
    'scan.debug.title', 'scan.debug.camera', 'scan.debug.formats',
-   'scan.debug.fps', 'scan.debug.last', 'scan.debug.attempts', 'scan.debug.status'].forEach(function (k) {
+   'scan.debug.fps', 'scan.debug.last', 'scan.debug.status'].forEach(function (k) {
     I18N.setLang('en'); var en = I18N.t(k);
     I18N.setLang('he'); var he = I18N.t(k);
     ok(k + ' (en+he present, non-key, distinct)', en !== k && he !== k && en !== he);
@@ -840,6 +840,72 @@ async function rejects(name, fn) {
     I18N.setLang('en'); var en = I18N.t(k);
     I18N.setLang('he'); var he = I18N.t(k);
     ok(k + ' (en+he present, non-key)', en !== k && he !== k);
+  });
+
+  // ---- Scanner decode-path proof (vendored ZXing) --------------------------
+  // Root-causes the "camera works but zero detections" bug from the OTHER end:
+  // it proves the vendored @zxing/library decode call path + our exact hints
+  // (POSSIBLE_FORMATS EAN-13/UPC-A/UPC-E/EAN-8 + TRY_HARDER) actually decode a
+  // real retail EAN-13. Continuous video decoding needs a device camera, but
+  // the per-frame decode this exercises is the SAME call the loop makes
+  // (reader.decode(video) -> BinaryBitmap(HybridBinarizer(luminance)) ->
+  // MultiFormatReader.decode(bitmap, hints)).
+  (function scannerDecodeProof() {
+    var Z = require('../vendor/zxing.min.js');
+    var L = { 0: '0001101', 1: '0011001', 2: '0010011', 3: '0111101', 4: '0100011', 5: '0110001', 6: '0101111', 7: '0111011', 8: '0110111', 9: '0001011' };
+    var G = { 0: '0100111', 1: '0110011', 2: '0011011', 3: '0100001', 4: '0011101', 5: '0111001', 6: '0000101', 7: '0010001', 8: '0001001', 9: '0010111' };
+    var R = { 0: '1110010', 1: '1100110', 2: '1101100', 3: '1000010', 4: '1011100', 5: '1001110', 6: '1010000', 7: '1000100', 8: '1001000', 9: '1110100' };
+    var PAR = { 0: 'LLLLLL', 1: 'LLGLGG', 2: 'LLGGLG', 3: 'LLGGGL', 4: 'LGLLGG', 5: 'LGGLLG', 6: 'LGGGLL', 7: 'LGLGLG', 8: 'LGLGGL', 9: 'LGGLGL' };
+    function encode(code) {
+      var d = code.split('').map(Number), bits = '101', par = PAR[d[0]], i;
+      for (i = 0; i < 6; i++) bits += (par[i] === 'L' ? L : G)[d[1 + i]];
+      bits += '01010';
+      for (i = 0; i < 6; i++) bits += R[d[7 + i]];
+      return bits + '101';
+    }
+    function decode(code) {
+      var bits = encode(code);
+      var MOD = 4, QZ = 12, H = 40, width = (95 + 2 * QZ) * MOD;
+      var lum = new Uint8ClampedArray(width * H);
+      for (var x = 0; x < width; x++) {
+        var mod = Math.floor(x / MOD) - QZ;
+        var v = (mod >= 0 && mod < 95) ? (bits[mod] === '1' ? 0 : 255) : 255;
+        for (var y = 0; y < H; y++) lum[y * width + x] = v;
+      }
+      var src = new Z.RGBLuminanceSource(lum, width, H);
+      var bmp = new Z.BinaryBitmap(new Z.HybridBinarizer(src));
+      var hints = new Map();
+      hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [Z.BarcodeFormat.EAN_13, Z.BarcodeFormat.UPC_A, Z.BarcodeFormat.UPC_E, Z.BarcodeFormat.EAN_8]);
+      hints.set(Z.DecodeHintType.TRY_HARDER, true);
+      return new Z.MultiFormatReader().decode(bmp, hints);
+    }
+    ok('vendored ZXing exposes MultiFormatReader + RGBLuminanceSource + exceptions',
+      typeof Z.MultiFormatReader === 'function' && typeof Z.RGBLuminanceSource === 'function' &&
+      typeof Z.NotFoundException === 'function' && typeof Z.BinaryBitmap === 'function');
+    ['7290000688077', '7290116537351'].forEach(function (code) {
+      var res = null, err = null;
+      try { res = decode(code); } catch (e) { err = e; }
+      ok('decodes generated EAN-13 ' + code + ' via vendored lib', !!res && res.getText() === code);
+      ok('reported format is EAN_13 for ' + code, !!res && res.getBarcodeFormat() === Z.BarcodeFormat.EAN_13);
+      if (err) ok('decode ' + code + ' did not throw', false);
+    });
+    // A blank (all-white) frame must raise NotFoundException — the "no code in
+    // frame" case our loop IGNORES rather than dying on.
+    var blank = new Uint8ClampedArray(200 * 40); blank.fill(255);
+    var notFound = false;
+    try {
+      new Z.MultiFormatReader().decode(new Z.BinaryBitmap(new Z.HybridBinarizer(new Z.RGBLuminanceSource(blank, 200, 40))), new Map());
+    } catch (e) { notFound = e instanceof Z.NotFoundException; }
+    ok('blank frame throws NotFoundException (loop ignores, keeps scanning)', notFound);
+  })();
+
+  // New scanner strings (feedback + timeout tips + expanded debug) in BOTH langs.
+  ['scan.found', 'scan.tipsTitle', 'scan.tipCloser', 'scan.tipLight', 'scan.tipSteady',
+   'scan.tipRotate', 'scan.tipManual', 'scan.debug.running', 'scan.debug.frames',
+   'scan.debug.error', 'scan.debug.format', 'scan.debug.yes', 'scan.debug.no'].forEach(function (k) {
+    I18N.setLang('en'); var en = I18N.t(k);
+    I18N.setLang('he'); var he = I18N.t(k);
+    ok(k + ' (en+he present, non-key)', en !== k && he !== k && en !== he);
   });
 
   console.log('\n============================');

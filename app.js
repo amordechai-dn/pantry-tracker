@@ -2618,17 +2618,48 @@
 
     // Dev-only debug telemetry (see maybeAttachDebug). Cheap counters kept
     // regardless; the panel is only rendered when the debug flag is on.
-    var dbg = { attempts: 0, lastAttempts: 0, fps: 0, lastCode: '-', w: 0, h: 0 };
+    var dbg = { attempts: 0, lastAttempts: 0, fps: 0, lastCode: '-', w: 0, h: 0,
+      running: false, format: '-', lastError: '-' };
     var dbgTimer = null;
     var dbgEls = null;
+
+    // Own resilient decode loop state (see startLoop). We drive decoding
+    // ourselves rather than relying on ZXing's decodeContinuously, whose loop
+    // permanently STOPS on any non-decoding throw (e.g. decoding a not-yet-sized
+    // video frame) — the root cause of "camera works but zero detections".
+    var stream = null;
+    var loopTimer = null;
+    var startedAt = 0;
+    var tipsShown = false;
+    var TIP_MS = 6000; // show guidance if nothing found after ~6s (keep scanning)
 
     var overlay = h('div', { class: 'overlay scanner center' });
     var video = h('video', { class: 'scan-video' });
     video.setAttribute('playsinline', 'true');
     video.setAttribute('muted', 'true');
     video.setAttribute('autoplay', 'true');
-    var frame = h('div', { class: 'scan-frame' }, video, h('div', { class: 'scan-reticle' }));
+    var codeBadge = h('div', { class: 'scan-code', dir: 'ltr' });
+    var frame = h('div', { class: 'scan-frame' }, video, h('div', { class: 'scan-reticle' }), codeBadge);
     var status = h('div', { class: 'scan-status', text: t('scan.point') });
+
+    // Guidance shown on the detection timeout (hidden until then). The camera
+    // keeps decoding in the background while these tips are visible.
+    var tips = h(
+      'div',
+      { class: 'scan-tips', style: 'display:none' },
+      h('div', { class: 'scan-tips-title', text: t('scan.tipsTitle') }),
+      h(
+        'ul',
+        { class: 'scan-tips-list' },
+        h('li', { text: t('scan.tipCloser') }),
+        h('li', { text: t('scan.tipLight') }),
+        h('li', { text: t('scan.tipSteady') }),
+        h('li', { text: t('scan.tipRotate') }),
+        h('li', { text: t('scan.tipManual') })
+      )
+    );
+    function showTips() { tipsShown = true; tips.style.display = 'block'; }
+    function hideTips() { tipsShown = false; tips.style.display = 'none'; }
 
     var toggleInput = h('input', { type: 'checkbox', class: 'scan-toggle-input' });
     toggleInput.addEventListener('change', function () {
@@ -2657,7 +2688,7 @@
         class: 'btn cancel',
         type: 'button',
         onclick: function () {
-          stop();
+          pauseLoop();
           openManualBarcode({ onCancel: resume, onSaved: closeSaved });
         },
       },
@@ -2675,15 +2706,30 @@
       frame,
       toggle,
       status,
+      tips,
       sessionBox,
       h('div', { class: 'actions' }, cancelBtn, manualBtn)
     );
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
 
+    // Pause decoding but KEEP the live stream (instant resume for the
+    // single-scan result / manual dialogs). No camera re-acquisition needed.
+    function pauseLoop() {
+      dbg.running = false;
+      if (loopTimer) { clearTimeout(loopTimer); loopTimer = null; }
+    }
+    // Full teardown: stop decoding, release the ZXing capture canvas, and stop
+    // the camera tracks. Called on close.
     function stop() {
-      try { if (controls) controls.stop(); } catch (e) {}
+      pauseLoop();
+      try { if (controls && controls.stop) controls.stop(); } catch (e) {}
       try { if (reader.reset) reader.reset(); } catch (e) {}
+      try {
+        if (stream && stream.getTracks) stream.getTracks().forEach(function (tr) { tr.stop(); });
+      } catch (e) {}
+      try { video.srcObject = null; } catch (e) {}
+      stream = null;
     }
 
     // ---- Dev-only debug panel ----
@@ -2711,18 +2757,26 @@
         camera: row(t('scan.debug.camera')),
         formats: row(t('scan.debug.formats')),
         fps: row(t('scan.debug.fps')),
+        running: row(t('scan.debug.running')),
+        frames: row(t('scan.debug.frames')),
         last: row(t('scan.debug.last')),
-        attempts: row(t('scan.debug.attempts')),
+        format: row(t('scan.debug.format')),
+        error: row(t('scan.debug.error')),
         status: row(t('scan.debug.status')),
       };
       dbgEls.formats.textContent = 'EAN-13, UPC-A, UPC-E, EAN-8';
       dbgTimer = setInterval(function () {
-        dbg.fps = dbg.attempts - dbg.lastAttempts; // updated once/sec
+        dbg.fps = dbg.attempts - dbg.lastAttempts; // frames processed in the last second
         dbg.lastAttempts = dbg.attempts;
         dbgEls.camera.textContent = dbg.w && dbg.h ? dbg.w + '×' + dbg.h : '-';
         dbgEls.fps.textContent = String(dbg.fps);
+        dbgEls.running.textContent = dbg.running ? t('scan.debug.yes') : t('scan.debug.no');
+        dbgEls.running.classList.toggle('ok', !!dbg.running);
+        dbgEls.frames.textContent = String(dbg.attempts);
         dbgEls.last.textContent = dbg.lastCode;
-        dbgEls.attempts.textContent = String(dbg.attempts);
+        dbgEls.format.textContent = dbg.format;
+        dbgEls.error.textContent = dbg.lastError;
+        dbgEls.error.classList.toggle('bad', dbg.lastError !== '-');
         dbgEls.status.textContent = (status.textContent || '').slice(0, 40);
       }, 1000);
     }
@@ -2759,38 +2813,124 @@
       } catch (e) {}
     }
 
+    // Map a ZXing BarcodeFormat enum value to a human label for the debug panel.
+    var FORMAT_NAMES = {};
+    (function () {
+      var B = ZXing.BarcodeFormat;
+      FORMAT_NAMES[B.EAN_13] = 'EAN-13';
+      FORMAT_NAMES[B.UPC_A] = 'UPC-A';
+      FORMAT_NAMES[B.UPC_E] = 'UPC-E';
+      FORMAT_NAMES[B.EAN_8] = 'EAN-8';
+    })();
+    // NotFound/Checksum/Format => "no valid code in this frame": ignore & keep
+    // looping. Anything else is a REAL error we surface (debug + never fatal).
+    function isNoCode(err) {
+      return err instanceof ZXing.NotFoundException ||
+        err instanceof ZXing.ChecksumException ||
+        err instanceof ZXing.FormatException;
+    }
+
+    // Explicitly acquire the REAR camera. We prefer facingMode:environment (the
+    // proven path that already showed a rear preview) and, when the platform
+    // exposes labels, refine to a back/rear/environment deviceId so multi-cam
+    // devices don't grab a wide/ultrawide lens that focuses poorly on barcodes.
+    function pickConstraints() {
+      var base = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+      var envConstraints = { audio: false, video: Object.assign({ facingMode: { ideal: 'environment' } }, base) };
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices)
+        return Promise.resolve(envConstraints);
+      return navigator.mediaDevices.enumerateDevices().then(function (devs) {
+        var cams = (devs || []).filter(function (d) { return d.kind === 'videoinput'; });
+        var rear = null;
+        for (var i = 0; i < cams.length; i++) {
+          var lbl = (cams[i].label || '').toLowerCase();
+          if (/back|rear|environment|arrière|arriere|traseir|trás|tras|rück/.test(lbl)) { rear = cams[i]; break; }
+        }
+        if (rear && rear.deviceId)
+          return { audio: false, video: Object.assign({ deviceId: { exact: rear.deviceId } }, base) };
+        return envConstraints;
+      }).catch(function () { return envConstraints; });
+    }
+
     function startDecode() {
-      // Request the REAR camera at the highest practical resolution. `ideal`
-      // keeps it best-effort so devices that can't hit 1080p still start.
-      var constraints = {
-        audio: false,
-        video: {
-          facingMode: { ideal: 'environment' },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-        },
-      };
-      reader
-        .decodeFromConstraints(constraints, video, function (result) {
-          dbg.attempts++; // counts every decode attempt (found or not)
-          if (result) { dbg.lastCode = result.getText(); onCode(result.getText()); }
-        })
-        .then(function (c) {
-          controls = c;
+      status.classList.remove('error');
+      status.textContent = t('scan.point');
+      hideTips();
+      pickConstraints()
+        .then(function (constraints) { return navigator.mediaDevices.getUserMedia(constraints); })
+        .then(function (s) {
+          if (closed) { s.getTracks().forEach(function (tr) { tr.stop(); }); return; }
+          stream = s;
+          video.srcObject = s;
+          video.setAttribute('playsinline', 'true');
+          var p = video.play();
+          if (p && p.catch) p.catch(function () {}); // autoplay policies: non-fatal
           applyAdvancedCamera();
+          startLoop();
         })
-        .catch(function () {
+        .catch(function (err) {
+          if (closed) return;
           status.textContent = t('scan.denied');
           status.classList.add('error');
+          dbg.lastError = (err && (err.name || err.message)) || 'getUserMedia failed';
         });
     }
+
+    // The heart of the fix: our OWN frame-by-frame loop. It NEVER dies on an
+    // unexpected throw, only decodes once the frame is genuinely ready (guarding
+    // the 0×0-canvas throw that silently killed ZXing's own loop), ignores
+    // "no code" exceptions, surfaces real ones, and keeps FPS/frame counters
+    // that truly reflect decoding — visible in the debug overlay.
+    function startLoop() {
+      dbg.running = true;
+      startedAt = Date.now();
+      tipsShown = false;
+      var DELAY = 90; // ~11 decode attempts/sec
+      function tick() {
+        if (closed || !dbg.running) return;
+        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+          dbg.w = video.videoWidth;
+          dbg.h = video.videoHeight;
+          dbg.attempts++; // FRAMES PROCESSED
+          try {
+            var result = reader.decode(video);
+            if (result) {
+              var text = result.getText();
+              dbg.lastCode = text;
+              try {
+                var fmt = result.getBarcodeFormat && result.getBarcodeFormat();
+                dbg.format = FORMAT_NAMES[fmt] || String(fmt);
+              } catch (e) {}
+              onCode(text);
+            }
+          } catch (err) {
+            if (!isNoCode(err)) dbg.lastError = (err && (err.name || err.message)) || String(err);
+          }
+        }
+        // Timeout guidance: keep decoding, just reveal tips once.
+        if (!tipsShown && !busy && !session.length && Date.now() - startedAt > TIP_MS) showTips();
+        loopTimer = setTimeout(tick, DELAY);
+      }
+      tick();
+    }
+
+    // Re-arm after a single-scan / manual dialog was cancelled. Instant when the
+    // stream is still live (OFF mode pauses rather than tears down); otherwise
+    // re-acquires the camera.
     function resume() {
       if (closed) return;
       busy = false;
       lastCode = null;
+      lastTime = 0;
       status.classList.remove('error');
       status.textContent = t('scan.point');
-      startDecode();
+      codeBadge.classList.remove('show');
+      hideTips();
+      if (stream && stream.active !== false) {
+        startLoop();
+      } else {
+        startDecode();
+      }
     }
 
     function renderSession() {
@@ -2848,8 +2988,7 @@
         byKey[prod.barcode] = e;
         session.push(e);
       }
-      hit();
-      status.textContent = t('scan.detected', { code: prod.barcode });
+      status.textContent = t('scan.found');
       renderSession();
     }
 
@@ -2882,7 +3021,6 @@
     // closeSaved() closes the scanner + refreshes on success.
     function handleSingle(code) {
       lookupBarcode(code).then(function (res) {
-        hit();
         openBarcodeResult(res, code, resume, closeSaved);
       });
     }
@@ -2893,18 +3031,28 @@
       refresh();
     }
 
+    // Briefly surface the raw detected number so the user immediately knows a
+    // scan landed (paired with the frame flash + beep + vibrate in hit()).
+    function showCode(code) {
+      codeBadge.textContent = code;
+      codeBadge.classList.add('show');
+    }
+
     function onCode(code) {
       var now = Date.now();
       if (closed) return;
-      if (code === lastCode && now - lastTime < 2500) return; // debounce dupes
+      if (code === lastCode && now - lastTime < 2500) return; // debounce dupes (~2.5s cooldown)
       lastCode = code;
       lastTime = now;
+      hideTips();
+      hit();          // flash frame + beep + vibrate
+      showCode(code); // show the detected barcode number
       if (continuous) {
         resolveForSession(code);
       } else {
         if (busy) return;
         busy = true;
-        stop();
+        stop(); // OFF: detect first code → stop the camera, then look up & route
         status.textContent = t('scan.looking');
         handleSingle(code);
       }

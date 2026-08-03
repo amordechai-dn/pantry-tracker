@@ -1420,6 +1420,53 @@ body {
   }
 }
 
+/* Detected barcode number badge (brief confirmation on the live frame). */
+.scan-code {
+  position: absolute;
+  inset-inline: 0;
+  inset-block-end: 10px;
+  margin-inline: auto;
+  width: fit-content;
+  max-width: 90%;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: rgba(53, 201, 138, 0.92);
+  color: #fff;
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 1px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  pointer-events: none;
+}
+.scan-code.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Detection-timeout guidance (camera keeps scanning behind it). */
+.scan-tips {
+  margin: 4px 0 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.scan-tips-title {
+  font-weight: 700;
+  font-size: 14px;
+  margin-block-end: 6px;
+}
+.scan-tips-list {
+  margin: 0;
+  padding-inline-start: 18px;
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
 /* ---- Scanner: session list (continuous mode) ---- */
 .scan-session {
   margin-block-start: 12px;
@@ -1713,4 +1760,14 @@ body {
   font-weight: 700;
   text-align: end;
   direction: ltr;
+}
+.scan-debug-val.ok {
+  color: #35c98a;
+}
+.scan-debug-val.bad {
+  color: var(--danger);
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
