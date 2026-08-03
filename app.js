@@ -1280,15 +1280,18 @@
           });
 
     // Header
+    // Unified icon control (opens the language chooser, which shows EN/HE and
+    // the current selection). Icon-only keeps the toolbar uniform + uncluttered.
     var langBtn = h(
       'button',
       {
-        class: 'lang-btn',
+        class: 'icon-btn',
         'aria-label': t('language.a11y'),
+        title: t('language.a11y') + ' (' + (window.I18N.getLang() === 'he' ? 'עברית' : 'English') + ')',
         // Wrap so the click event isn't passed as the re-render callback.
         onclick: function () { openLang(renderMain); },
       },
-      '🌐 ' + (window.I18N.getLang() === 'he' ? 'עב' : 'EN')
+      '🌐'
     );
     var monthlyBtn = h(
       'button',

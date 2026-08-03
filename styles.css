@@ -50,23 +50,29 @@ body {
   padding-block-end: calc(env(safe-area-inset-bottom, 0px) + 96px);
 }
 
-/* ---- Header ---- */
+/* ---- Header / toolbar ---- */
+/* The header wraps: on narrow screens the title takes the first line and the
+   control cluster flows to the next line (right/inline-end aligned), so NO
+   control is ever clipped or overflows. */
 .header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  column-gap: 16px;
+  row-gap: 10px;
   padding-inline: 20px;
-  padding-block-end: 12px;
+  padding-block-end: 14px;
 }
 .header-text {
-  flex: 1;
+  flex: 1 1 240px;
   min-width: 0;
 }
 .title {
   margin: 0;
   font-size: 28px;
   font-weight: 800;
+  line-height: 1.15;
   color: var(--text);
 }
 .subtitle {
@@ -79,50 +85,66 @@ body {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 4px;
+  gap: 6px;
+  margin-inline-start: auto; /* keep the cluster at the inline-end (RTL-safe) */
 }
 .header-btn-row {
   display: flex;
+  flex-wrap: wrap; /* controls wrap instead of clipping */
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
 }
+/* Unified toolbar control: every header button is the SAME 44x44 touch target,
+   same radius, same (zero) padding — an icon-only cluster for a clean, modern
+   toolbar (Keep/Notion/Apple quality). */
 .icon-btn {
-  width: 38px;
-  height: 38px;
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  padding: 0;
   border-radius: 999px;
   background: var(--card);
   border: 1px solid var(--border);
-  font-size: 18px;
+  color: var(--text);
+  font-size: 19px;
   line-height: 1;
   cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.icon-btn:active {
-  opacity: 0.7;
-}
-.lang-btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 8px 14px;
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--text);
-  cursor: pointer;
+  justify-content: center;
+  transition: background 0.18s ease, border-color 0.18s ease,
+    transform 0.12s ease, box-shadow 0.18s ease;
 }
-.lang-btn:active {
-  opacity: 0.7;
+/* Smooth hover only on real pointer devices; press animation everywhere. */
+@media (hover: hover) {
+  .icon-btn:hover {
+    background: var(--primary-soft);
+    border-color: var(--primary);
+    box-shadow: var(--shadow-card);
+  }
+}
+.icon-btn:active {
+  transform: scale(0.92);
+}
+.icon-btn:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 .version {
   font-size: 11px;
   font-weight: 600;
   color: var(--muted);
   letter-spacing: 0.3px;
+}
+/* Tighten the title on very small phones so it never crowds the toolbar. */
+@media (max-width: 400px) {
+  .title {
+    font-size: 23px;
+  }
+  .subtitle {
+    font-size: 14px;
+  }
 }
 
 /* ---- List ---- */
@@ -298,6 +320,43 @@ body {
     box-shadow: none;
     border: 1px solid var(--border);
     padding: 10px;
+  }
+}
+
+/* Tablet (768–1023): use the extra width without over-stretching one column. */
+@media (min-width: 768px) and (max-width: 1023px) {
+  #root {
+    max-width: 760px;
+  }
+}
+
+/* From tablet up, inventory cards flow into a responsive multi-column grid so
+   wide screens aren't a long, wasteful single column. Section headers span the
+   full row. Below 768px it stays a comfortable single column. */
+@media (min-width: 768px) {
+  .list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 12px;
+    align-items: start;
+  }
+  .list .card {
+    margin-block-end: 0;
+  }
+  .list .section-header {
+    grid-column: 1 / -1;
+    margin-block: 10px 0;
+  }
+}
+
+/* Very large screens (>=1440): widen the shell + side panel a bit (still
+   capped) so 1440/1920 monitors use space sensibly, not stretched or wasted. */
+@media (min-width: 1440px) {
+  #root {
+    max-width: 1320px;
+  }
+  .main-layout {
+    grid-template-columns: minmax(0, 1fr) 400px;
   }
 }
 .section-header {
