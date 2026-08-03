@@ -231,6 +231,8 @@
         errUrl: 'Enter a valid Supabase URL and anon key first.',
         errLink: 'Could not link. Check the code and your connection.',
         errGeneric: 'Something went wrong. Please try again.',
+        linkUnavailable:
+          'Device linking needs a one-time backend update. Re-run sync/schema.sql in Supabase. Data sync keeps working.',
       },
       auth: {
         title: 'HomeStock',
@@ -503,6 +505,8 @@
         errUrl: 'הזינו תחילה כתובת Supabase ומפתח anon תקינים.',
         errLink: 'הקישור נכשל. בדקו את הקוד ואת החיבור.',
         errGeneric: 'משהו השתבש. נסו שוב.',
+        linkUnavailable:
+          'קישור מכשירים דורש עדכון חד-פעמי בשרת. הריצו מחדש את sync/schema.sql ב-Supabase. סנכרון הנתונים ממשיך לעבוד.',
       },
       auth: {
         title: 'HomeStock',

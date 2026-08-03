@@ -1525,6 +1525,15 @@ body {
   margin: 0;
   line-height: 1.4;
 }
+.conflict-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-block-start: 6px;
+}
+.conflict-actions .btn {
+  width: 100%;
+}
 .sync-note.sync-error {
   color: var(--danger);
 }

@@ -580,6 +580,155 @@ async function rejects(name, fn) {
     ok(k + ' (en+he present, non-key)', en !== k && he !== k);
   });
 
+  // ---------------------------------------------------------------------------
+  console.log('\n[sync: v1.14.0 auto-sync + resilience]');
+
+  // Helper: a scripted fetch mock the CloudRepository can use. `plan` maps a
+  // URL-substring -> array of responses consumed in order.
+  function makeFetch(plan) {
+    var calls = [];
+    global.fetch = function (url, opts) {
+      calls.push({ url: url, opts: opts });
+      var key = Object.keys(plan).find(function (k) { return url.indexOf(k) >= 0; });
+      var seq = key ? plan[key] : null;
+      var resp = seq && seq.length ? (seq.length > 1 ? seq.shift() : seq[0]) : { status: 200, body: [] };
+      return Promise.resolve({
+        ok: resp.status >= 200 && resp.status < 300,
+        status: resp.status,
+        headers: { get: function () { return 'application/json'; } },
+        json: function () { return Promise.resolve(resp.body != null ? resp.body : []); },
+        text: function () { return Promise.resolve(JSON.stringify(resp.body != null ? resp.body : {})); },
+      });
+    };
+    global.fetch.__calls = calls;
+    return calls;
+  }
+  var cfg14 = { url: 'https://x.supabase.co', anonKey: 'anon' };
+
+  // (A) Expired JWT -> transparent refresh + retry, and the new session is
+  //     persisted via onSession (this is the ROOT-CAUSE fix for 'Sync error').
+  makeFetch({
+    '/rest/v1/inventory_items': [
+      { status: 401, body: { code: 'PGRST301', message: 'JWT expired' } },
+      { status: 200, body: [{ id: 'r1', data: { id: 'r1' }, updated_at: '2026-01-01' }] },
+    ],
+    '/auth/v1/token': [{ status: 200, body: { access_token: 'fresh', refresh_token: 'r2' } }],
+  });
+  var persisted14 = null;
+  var repo14 = new HS.CloudRepository(cfg14, { access_token: 'stale', refresh_token: 'r1' });
+  repo14.onSession = function (s) { persisted14 = s; };
+  var pulled14 = await repo14.selectSince('inventory_items', 'uid', null);
+  ok('401 on data call auto-refreshes the session and retries', Array.isArray(pulled14) && pulled14.length === 1);
+  ok('refreshed session is persisted via onSession (survives reload)',
+    !!(persisted14 && persisted14.access_token === 'fresh'));
+  ok('repo now carries the fresh access_token', repo14.session.access_token === 'fresh');
+
+  // (B) syncNow with a stale token drives status to IDLE (Synced), NOT error.
+  makeFetch({
+    '/rest/v1/inventory_items': [
+      { status: 401, body: {} },
+      { status: 200, body: [] },
+    ],
+    '/auth/v1/token': [{ status: 200, body: { access_token: 'fresh', refresh_token: 'r2' } }],
+  });
+  var statuses14 = [];
+  var repoB = new HS.CloudRepository(cfg14, { access_token: 'stale', refresh_token: 'r1' });
+  var qB = new HS.SyncQueue({ getItem: function () { return null; }, setItem: function () {} }, 'qB');
+  var mgrB = new HS.SyncManager({ cfg: cfg14, repo: repoB, queue: qB,
+    storage: { getItem: function () { return null; }, setItem: function () {} },
+    getUserId: function () { return 'uid'; }, onStatus: function (s) { statuses14.push(s); },
+    pullIntervalMs: 0 });
+  mgrB.onPull = function () { return repoB.selectSince('inventory_items', 'uid', null); };
+  var okB = await mgrB.syncNow();
+  ok('syncNow recovers from a stale token -> resolves true', okB === true);
+  ok('final status is IDLE (Synced), never ERROR, on stale-token recovery', mgrB.status === HS.STATUS.IDLE);
+
+  // (C) Resilient push: a permanent 4xx op is DROPPED (poison) so it can't wedge
+  //     the queue; a transient failure STOPS and preserves the remaining queue.
+  makeFetch({
+    '/rest/v1/inventory_items': [
+      { status: 400, body: { code: '22P02', message: 'bad row' } }, // poison -> drop
+      { status: 200, body: [{}] }, // second op succeeds
+    ],
+  });
+  var pushStor = (function () { var m = {}; return { getItem: function (k) { return k in m ? m[k] : null; }, setItem: function (k, v) { m[k] = String(v); } }; })();
+  var qC = new HS.SyncQueue(pushStor, 'qC');
+  qC.enqueue({ table: 'inventory_items', opType: 'upsert', recordId: 'bad', payload: { id: 'bad' } });
+  qC.enqueue({ table: 'inventory_items', opType: 'upsert', recordId: 'good', payload: { id: 'good' } });
+  var repoC = new HS.CloudRepository(cfg14, { access_token: 't' });
+  var mgrC = new HS.SyncManager({ cfg: cfg14, repo: repoC, queue: qC, storage: pushStor,
+    getUserId: function () { return 'uid'; }, pullIntervalMs: 0 });
+  await mgrC._push();
+  ok('resilient push drops the poison (4xx) op AND sends the rest -> queue empty', qC.size() === 0);
+  ok('poison op is recorded as lastError (surfaced, not silently ignored)',
+    !!(mgrC.lastError && mgrC.lastError.status === 400));
+
+  makeFetch({ '/rest/v1/inventory_items': [{ status: 503, body: {} }] }); // transient
+  var qD = new HS.SyncQueue(pushStor, 'qD');
+  qD.enqueue({ table: 'inventory_items', opType: 'upsert', recordId: 'x', payload: { id: 'x' } });
+  var repoD = new HS.CloudRepository(cfg14, { access_token: 't' });
+  var mgrD = new HS.SyncManager({ cfg: cfg14, repo: repoD, queue: qD, storage: pushStor,
+    getUserId: function () { return 'uid'; }, pullIntervalMs: 0 });
+  var threw = false;
+  await mgrD._push().catch(function () { threw = true; });
+  ok('transient (5xx) push STOPS and keeps the queue (offline-safe)', threw === true && qD.size() === 1);
+
+  // (D) Auto-push: every local mutation enqueues + schedules a debounced push.
+  var qE = new HS.SyncQueue(pushStor, 'qE');
+  var scheduled = 0;
+  var mgrE = new HS.SyncManager({ cfg: cfg14, repo: new HS.CloudRepository(cfg14), queue: qE,
+    storage: pushStor, getUserId: function () { return 'uid'; }, pullIntervalMs: 0 });
+  mgrE.scheduleSync = function () { scheduled++; }; // observe without real timers
+  ['upsert', 'delete', 'upsert'].forEach(function (op, i) {
+    mgrE.notifyLocalMutation({ table: 'inventory_items', opType: op, recordId: 'm' + i, payload: { id: 'm' + i } });
+  });
+  ok('auto-push: each mutation enqueues an op', qE.size() === 3);
+  ok('auto-push: each mutation schedules a debounced push', scheduled === 3);
+  ok('SyncManager defaults to a lightweight periodic pull (~25s)',
+    new HS.SyncManager({ cfg: cfg14 }).pullIntervalMs === 25000);
+  ok('periodic pull is configurable / disablable (0)',
+    new HS.SyncManager({ cfg: cfg14, pullIntervalMs: 0 }).pullIntervalMs === 0);
+
+  // (E) Linking is DECOUPLED from data sync: a failing create_link_token (the
+  //     known pgcrypto/DDL gap) must NOT flip the sync engine to 'error'.
+  makeFetch({
+    '/rest/v1/rpc/create_link_token': [{ status: 404, body: { code: '42883', message: 'function digest(text, unknown) does not exist' } }],
+    '/rest/v1/inventory_items': [{ status: 200, body: [] }],
+  });
+  var repoF = new HS.CloudRepository(cfg14, { access_token: 't' });
+  var linkErr = null;
+  await repoF.createLinkToken('tok', 60).catch(function (e) { linkErr = e; });
+  ok('create_link_token still fails with the known 404/42883 (pending schema re-run)',
+    !!(linkErr && linkErr.status === 404));
+  var qF = new HS.SyncQueue(pushStor, 'qF');
+  var mgrF = new HS.SyncManager({ cfg: cfg14, repo: repoF, queue: qF, storage: pushStor,
+    getUserId: function () { return 'uid'; }, pullIntervalMs: 0 });
+  mgrF.onPull = function () { return repoF.selectSince('inventory_items', 'uid', null); };
+  await mgrF.syncNow();
+  ok('linking failure does NOT set a global sync error (data sync stays IDLE)', mgrF.status === HS.STATUS.IDLE);
+
+  // (F) Pull conflict rule (pure): only a TRUE concurrent quantity conflict —
+  //     both sides changed since `since` to different values — needs a dialog.
+  var since14 = '2026-05-01T00:00:00.000Z';
+  ok('conflict when BOTH changed since last sync to different quantities',
+    AppI.isConcurrentQtyConflict({ id: 'a', quantity: 8, updatedAt: '2026-05-02' }, { id: 'a', quantity: 5 }, since14) === true);
+  ok('no conflict when only remote changed (local untouched since sync) -> LWW',
+    AppI.isConcurrentQtyConflict({ id: 'a', quantity: 8, updatedAt: '2026-04-01' }, { id: 'a', quantity: 5 }, since14) === false);
+  ok('no conflict when quantities agree (own change echoed back)',
+    AppI.isConcurrentQtyConflict({ id: 'a', quantity: 5, updatedAt: '2026-05-02' }, { id: 'a', quantity: 5 }, since14) === false);
+  ok('no conflict on first sync (no `since` baseline)',
+    AppI.isConcurrentQtyConflict({ id: 'a', quantity: 8, updatedAt: '2026-05-02' }, { id: 'a', quantity: 5 }, null) === false);
+  ok('no conflict when the item is new locally (no local copy)',
+    AppI.isConcurrentQtyConflict(null, { id: 'a', quantity: 5 }, since14) === false);
+
+  // Linking-unavailable message exists in BOTH languages (graceful, not generic).
+  I18N.setLang('en'); var luEn = I18N.t('sync.linkUnavailable');
+  I18N.setLang('he'); var luHe = I18N.t('sync.linkUnavailable');
+  ok('sync.linkUnavailable present in EN + HE (clear "re-run schema" message)',
+    luEn !== 'sync.linkUnavailable' && luHe !== 'sync.linkUnavailable' && /schema/i.test(luEn));
+
+  delete global.fetch;
+
   console.log('\n============================');
   console.log('PASS ' + pass + '  FAIL ' + fail);
   console.log('============================');

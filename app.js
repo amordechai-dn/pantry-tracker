@@ -3268,6 +3268,7 @@
   var SYNC_URL_KEY = 'pantry.sync.url';
   var SYNC_ANON_KEY = 'pantry.sync.anonKey';
   var syncMgr = null; // HomeSync.SyncManager instance (when active)
+  var syncMgrProfile = null; // local profile id the running engine is bound to
   var homeSyncPromise = null; // lazy-load promise for sync/homesync.js
   var qrPromise = null; // lazy-load promise for vendor/qrcode.js
   var suppressSyncHook = false; // guard so remote-applied writes don't re-queue
@@ -3398,16 +3399,45 @@
     return d;
   }
 
-  // Boot sync ONLY if configured + linked. Safe to call anytime; no-ops when
-  // dormant. Registers the DB mutation hook and starts the SyncManager.
+  // Tear down the running engine WITHOUT clearing stored credentials (used when
+  // switching profiles or when a profile becomes unlinked). Safe to call anytime.
+  function syncStopEngine() {
+    if (syncMgr && syncMgr.stop) syncMgr.stop();
+    syncMgr = null;
+    syncMgrProfile = null;
+    if (window.PantryDB && window.PantryDB.onMutation) window.PantryDB.onMutation(null);
+  }
+
+  // Boot / refresh cross-device sync. Called on every login (enterApp) and after
+  // enabling/linking. Safe to call anytime; no-ops when dormant. When already
+  // running for the SAME profile it just triggers a full sync (push + pull) so
+  // each login pulls the latest; when the profile changed it rebinds cleanly.
   function syncBoot() {
-    if (syncMgr) return; // already running
-    if (!syncConfigured() || !syncLinked()) return; // dormant
+    var profile = (window.CurrentUser && window.CurrentUser.id()) || null;
+    if (!syncConfigured() || !syncLinked()) {
+      // Dormant / unlinked for this profile — stop any engine from a prior one.
+      if (syncMgr) syncStopEngine();
+      return;
+    }
+    if (syncMgr && syncMgrProfile === profile) {
+      // Already active for this profile: a login/return should pull latest now.
+      syncMgr.syncNow();
+      return;
+    }
+    if (syncMgr) syncStopEngine(); // profile changed -> rebind to the new one
     loadHomeSync()
       .then(function (HS) {
+        // Guard against a profile switch mid-load.
+        if (((window.CurrentUser && window.CurrentUser.id()) || null) !== profile) return;
         var cfg = syncGetConfig();
         var st = syncLoadState();
         var repo = new HS.CloudRepository(cfg, st.session);
+        // Persist refreshed tokens so a stale JWT never resurfaces as an error.
+        repo.onSession = function (sess) {
+          var cur = syncLoadState();
+          cur.session = sess;
+          syncSaveState(cur);
+        };
         var queue = new HS.SyncQueue(localStorage, 'pantry.sync.queue.' + st.cloudUserId);
         syncMgr = new HS.SyncManager({
           cfg: cfg,
@@ -3416,7 +3446,9 @@
           storage: localStorage,
           getUserId: function () { return st.cloudUserId; },
           onStatus: function (s) { updateSyncIndicator(s); },
+          pullIntervalMs: 25000, // lightweight periodic pull while active + online
         });
+        syncMgrProfile = profile;
         syncMgr.onPull = function () { return syncPull(HS, repo, st); };
         // Capture local mutations -> queue + debounced push (unless we are the
         // ones applying a remote change).
@@ -3436,7 +3468,7 @@
             payload: payload,
           });
         });
-        syncMgr.start();
+        syncMgr.start(); // attaches focus/visibility/online + periodic pull, runs a sync
         updateSyncIndicator(syncMgr.status);
       })
       .catch(function () {
@@ -3444,8 +3476,27 @@
       });
   }
 
-  // Pull remote inventory deltas and merge (last-write-wins) into local IDB.
+  // Pure rule: is this a TRUE concurrent quantity conflict worth a dialog?
+  // A pulled `remote` is already a delta (changed since `since`); it conflicts
+  // only when the local copy ALSO changed since `since` and the quantities
+  // disagree. Without a `since` (first sync) we can't tell, so it's not a
+  // conflict (last-write-wins handles it).
+  function isConcurrentQtyConflict(local, remote, since) {
+    return !!(
+      local && remote && since &&
+      typeof local.quantity === 'number' &&
+      typeof remote.quantity === 'number' &&
+      local.quantity !== remote.quantity &&
+      String(local.updatedAt || '') > String(since)
+    );
+  }
+
+  // Pull remote inventory deltas and merge into local IDB. Last-write-wins by
+  // updatedAt; a TRUE concurrent quantity conflict (both sides changed the same
+  // item since the last sync, to different values) is surfaced via a dialog.
   // Remote-applied writes are guarded so they don't re-enter the sync queue.
+  // Re-renders the CURRENT view live (only when something changed) so a device
+  // "updates by itself" without losing the active profile or an open dialog.
   function syncPull(HS, repo, st) {
     var since = null;
     try { since = localStorage.getItem('pantry.sync.lastAt'); } catch (e) {}
@@ -3455,9 +3506,20 @@
         var localById = {};
         localItems.forEach(function (x) { localById[x.id] = x; });
         var chain = Promise.resolve();
+        var applied = 0;
+        var conflicts = [];
         rows.map(cloudRowToItem).forEach(function (r) {
-          var winner = HS.ConflictResolver.resolveRecord(localById[r.id], r);
+          var local = localById[r.id];
+          // True concurrent quantity conflict: the local copy also changed
+          // since the last sync (remote is a delta by definition) and the two
+          // quantities disagree. First sync (no `since`) can't tell -> LWW.
+          if (isConcurrentQtyConflict(local, r, since)) {
+            conflicts.push({ local: local, remote: r });
+            return;
+          }
+          var winner = HS.ConflictResolver.resolveRecord(local, r);
           if (winner === r) {
+            applied++;
             chain = chain.then(function () {
               suppressSyncHook = true;
               return window.PantryDB.put(r).then(
@@ -3467,9 +3529,76 @@
             });
           }
         });
-        return chain.then(function () { recomputeShortfall(); renderMain(); });
+        return chain.then(function () {
+          if (applied) { recomputeShortfall(); renderCurrentView(); }
+          if (conflicts.length) syncQueueConflicts(HS, conflicts);
+        });
       });
     });
+  }
+
+  // Resolve true concurrent quantity conflicts one at a time via a small dialog.
+  // While unresolved they sit in syncMgr.pendingConflicts so the status shows
+  // "Conflict". Each choice is written locally (which re-queues a push).
+  function syncQueueConflicts(HS, conflicts) {
+    if (!syncMgr) return;
+    conflicts.forEach(function (c) {
+      // De-dupe by id so repeated pulls don't stack the same conflict.
+      var exists = syncMgr.pendingConflicts.some(function (p) {
+        return p.local && c.local && p.local.id === c.local.id;
+      });
+      if (!exists) syncMgr.pendingConflicts.push(c);
+    });
+    updateSyncIndicator('conflict');
+    syncShowNextConflict(HS);
+  }
+
+  function syncShowNextConflict(HS) {
+    if (!syncMgr || !syncMgr.pendingConflicts.length) {
+      if (syncMgr) updateSyncIndicator(syncMgr.status);
+      return;
+    }
+    var c = syncMgr.pendingConflicts[0];
+    openQuantityConflict(c.local, c.remote, function (chosenQty) {
+      var merged = Object.assign({}, c.remote, {
+        quantity: chosenQty,
+        updatedAt: new Date().toISOString(),
+      });
+      suppressSyncHook = false; // this local write SHOULD push our decision
+      window.PantryDB.put(merged)
+        .then(function () {})
+        .catch(function () {})
+        .then(function () {
+          syncMgr.pendingConflicts.shift();
+          recomputeShortfall();
+          renderCurrentView();
+          if (!syncMgr.pendingConflicts.length) updateSyncIndicator(syncMgr.status);
+          syncShowNextConflict(HS);
+        });
+    });
+  }
+
+  // Dialog for a single quantity conflict: keep this device / keep other / add.
+  function openQuantityConflict(local, remote, onChoose) {
+    var name = itemName(local) || itemName(remote) || '';
+    var lq = typeof local.quantity === 'number' ? local.quantity : 0;
+    var rq = typeof remote.quantity === 'number' ? remote.quantity : 0;
+    var overlay = h('div', { class: 'overlay center' });
+    var card = h('div', { class: 'sync-body conflict-card' });
+    card.appendChild(h('h3', { dir: 'auto', text: t('sync.conflictTitle') }));
+    if (name) card.appendChild(h('p', { class: 'sync-note', dir: 'auto', text: name }));
+    card.appendChild(h('p', { class: 'sync-note', dir: 'auto', text: t('sync.conflictBody') }));
+    function pick(qty) { overlay.remove(); onChoose(qty); }
+    var row = h('div', { class: 'conflict-actions' });
+    row.appendChild(h('button', { class: 'btn', type: 'button',
+      onclick: function () { pick(lq); } }, t('sync.keepLocal') + ' (' + lq + ')'));
+    row.appendChild(h('button', { class: 'btn', type: 'button',
+      onclick: function () { pick(rq); } }, t('sync.keepCloud') + ' (' + rq + ')'));
+    row.appendChild(h('button', { class: 'btn ghost', type: 'button',
+      onclick: function () { pick(lq + rq); } }, t('sync.addTogether') + ' (' + (lq + rq) + ')'));
+    card.appendChild(row);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
   }
 
   // First device: anonymous sign-in, create household, migrate local data up.
@@ -3604,9 +3733,7 @@
   }
 
   function syncDisconnect() {
-    if (syncMgr && syncMgr.stop) syncMgr.stop();
-    syncMgr = null;
-    window.PantryDB.onMutation(null);
+    syncStopEngine();
     try {
       localStorage.removeItem(syncStateKey());
     } catch (e) {}
@@ -3707,9 +3834,17 @@
             }));
             linkArea.appendChild(h('label', { class: 'field-label', text: t('sync.linkUrl') }));
             linkArea.appendChild(urlField);
-          }).catch(function () {
+          }).catch(function (err) {
             linkArea.innerHTML = '';
-            linkArea.appendChild(note(t('sync.errGeneric'), 'sync-error'));
+            // A failed link-token mint is a KNOWN pending user action (re-run
+            // schema.sql for pgcrypto); it must never look like a data-sync
+            // error. Show a precise, localized "linking unavailable" note.
+            var msg = (err && err.message) || '';
+            if ((err && err.status === 404) || /digest|42883|does not exist/i.test(msg)) {
+              linkArea.appendChild(note(t('sync.linkUnavailable'), 'sync-error'));
+            } else {
+              linkArea.appendChild(note(t('sync.errGeneric'), 'sync-error'));
+            }
           });
         }));
         body.appendChild(linkArea);
@@ -3886,6 +4021,7 @@
 
   // Clear only the active selection and return to the picker (deletes NO data).
   function chooseAnother() {
+    syncStopEngine(); // stop this profile's periodic pull / listeners
     window.Auth.logout();
     window.PantryDB.setUser(null); // drop data scope
     window.I18N.setUser(null); // back to the shared picker language
@@ -3976,6 +4112,7 @@
       syncConfigured: syncConfigured,
       cloudTableFor: cloudTableFor,
       mapItemToCloud: mapItemToCloud,
+      isConcurrentQtyConflict: isConcurrentQtyConflict,
       parseLinkToken: parseLinkToken,
       syncAutoRedeem: syncAutoRedeem,
       // Responsive Shopping List — one shared renderer + pure breakpoint logic.

@@ -133,6 +133,13 @@
     this.items = [];
     this._save();
   };
+  // Remove and return the head op (used by the resilient push loop so a single
+  // permanently-rejected op can be dropped without wedging the whole queue).
+  SyncQueue.prototype.removeFirst = function () {
+    var op = this.items.shift();
+    this._save();
+    return op;
+  };
   // Flush in FIFO order. sendFn(op) -> Promise. On the first failure we stop and
   // KEEP the failed op (and everything after it) so nothing is lost while
   // offline; resolves with the list of ops that were sent successfully.
@@ -369,14 +376,44 @@
     if (extra) for (var k in extra) h[k] = extra[k];
     return h;
   };
-  CloudRepository.prototype._fetch = function (path, opts) {
+  // Low-level request. On a 401/403 (typically an EXPIRED anonymous JWT) it
+  // transparently refreshes the session ONCE via the refresh_token and retries,
+  // so a stale token on re-login never surfaces as a "Sync error". Auth
+  // endpoints themselves are never auto-refreshed (avoids recursion).
+  CloudRepository.prototype._fetch = function (path, opts, _retried) {
+    var self = this;
     if (typeof fetch !== 'function') {
       return Promise.reject(new Error('fetch unavailable'));
     }
+    var isAuthPath = path.indexOf('/auth/v1/') === 0;
     return fetch(this.url + path, opts).then(function (res) {
+      if (
+        (res.status === 401 || res.status === 403) &&
+        !_retried &&
+        !isAuthPath &&
+        self.session &&
+        self.session.refresh_token
+      ) {
+        return self.refreshSession().then(
+          function () {
+            if (opts && opts.headers && opts.headers.Authorization) {
+              opts.headers.Authorization = 'Bearer ' + self._authToken();
+            }
+            return self._fetch(path, opts, true);
+          },
+          function () {
+            // Refresh failed — report the original auth error (transient).
+            var e = new Error('HTTP ' + res.status + ': auth refresh failed');
+            e.status = res.status;
+            throw e;
+          }
+        );
+      }
       if (!res.ok) {
         return res.text().then(function (t) {
-          throw new Error('HTTP ' + res.status + ': ' + t);
+          var e = new Error('HTTP ' + res.status + ': ' + t);
+          e.status = res.status;
+          throw e;
         });
       }
       var ct = res.headers.get('content-type') || '';
@@ -406,6 +443,10 @@
       body: JSON.stringify({ refresh_token: this.session.refresh_token }),
     }).then(function (out) {
       self.session = out;
+      // Let the app persist the refreshed tokens so they survive reloads.
+      if (typeof self.onSession === 'function') {
+        try { self.onSession(out); } catch (e) {}
+      }
       return out;
     });
   };
@@ -488,12 +529,23 @@
     this.onStatus = opts.onStatus || function () {};
     this.getUserId = opts.getUserId || function () { return null; };
     this.debounceMs = opts.debounceMs || 1500;
+    // Lightweight periodic pull while the app is active + online (0 disables).
+    this.pullIntervalMs = opts.pullIntervalMs != null ? opts.pullIntervalMs : 25000;
     this.status = STATUS.IDLE;
     this.lastSyncAt = null;
+    this.lastError = null;
     this.pendingConflicts = [];
     this._timer = null;
+    this._interval = null;
     this._boundHandlers = null;
     this._syncing = false;
+  }
+  // Categorize a failed request: permanent client errors (bad row/route) must
+  // NOT wedge the queue or flip the whole sync to "error"; transient ones
+  // (offline, 5xx, auth-after-failed-refresh) should stop and be retried later.
+  function isPermanentError(err) {
+    var s = err && err.status;
+    return s === 400 || s === 404 || s === 409 || s === 422;
   }
   SyncManager.prototype._setStatus = function (s) {
     this.status = s;
@@ -532,9 +584,22 @@
       });
     }
     this._setStatus(this._online() ? STATUS.IDLE : STATUS.OFFLINE);
+    // Lightweight periodic pull so a device "updates by itself" when another
+    // device changed data — only fires when online and the tab is visible.
+    if (this.pullIntervalMs > 0 && typeof setInterval === 'function') {
+      this._interval = setInterval(function () {
+        if (!self._online()) return;
+        if (typeof document !== 'undefined' && document.hidden) return;
+        self.scheduleSync(0);
+      }, this.pullIntervalMs);
+    }
     this.scheduleSync(0);
   };
   SyncManager.prototype.stop = function () {
+    if (this._interval) {
+      clearInterval(this._interval);
+      this._interval = null;
+    }
     if (!this._boundHandlers || typeof global.removeEventListener !== 'function') {
       this._boundHandlers = null;
       return;
@@ -583,6 +648,7 @@
       })
       .then(function () {
         self.lastSyncAt = nowIso();
+        self.lastError = null;
         if (self.storage) {
           try {
             self.storage.setItem('pantry.sync.lastAt', self.lastSyncAt);
@@ -593,7 +659,8 @@
         );
         return true;
       })
-      .catch(function () {
+      .catch(function (err) {
+        self.lastError = err || null;
         self._setStatus(self._online() ? STATUS.ERROR : STATUS.OFFLINE);
         return false;
       })
@@ -602,15 +669,38 @@
         return r;
       });
   };
+  // Resilient push: process the queue in FIFO order. A permanently-rejected op
+  // (bad row/route — 4xx) is DROPPED so it can't wedge the queue or error every
+  // future sync; a transient failure (offline/5xx/auth) STOPS and keeps the
+  // remaining queue for a later retry (offline-first).
   SyncManager.prototype._push = function () {
     var self = this;
     if (!this.queue || !this.repo) return Promise.resolve();
-    return this.queue.flush(function (op) {
-      if (op.opType === 'delete') {
-        return self.repo.delete(op.table, op.recordId);
-      }
+    function send(op) {
+      if (op.opType === 'delete') return self.repo.delete(op.table, op.recordId);
       return self.repo.upsert(op.table, op.payload);
-    });
+    }
+    function step() {
+      var items = self.queue.peekAll();
+      if (!items.length) return Promise.resolve();
+      var op = items[0];
+      return send(op).then(
+        function () {
+          self.queue.removeFirst();
+          return step();
+        },
+        function (err) {
+          if (isPermanentError(err)) {
+            // Poison op: record it, drop it, keep going with the rest.
+            self.lastError = err;
+            self.queue.removeFirst();
+            return step();
+          }
+          throw err; // transient -> stop; remaining queue is preserved
+        }
+      );
+    }
+    return step();
   };
 
   // ---------------------------------------------------------------- exports --
